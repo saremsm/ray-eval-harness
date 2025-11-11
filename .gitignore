@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.ray/
+/tmp/ray/
+*.egg-info/
+.DS_Store
+results/*.jsonl
