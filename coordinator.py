@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
+
 import ray
+
 from aggregator import ResultsAggregator
-from types_ import EvalResult, EvalTask
+from types_ import EvalResult, EvalTask, FailureKind
+
 from utils import make_batches
 from worker import HFWorker
+
 logger = logging.getLogger(__name__)
+
+_DETERMINISTIC_PATTERNS = (
+    "token indices sequence length",
+    "index out of range",
+)
 
 def validate_backend(worker: object) -> None:
     """hasattr, not isinstance() (fails on Ray handles); fail at startup, not first batch."""
@@ -18,16 +28,29 @@ def validate_backend(worker: object) -> None:
             f"Worker {worker!r} is missing required methods: {missing}. "
             "All workers must satisfy the EvalBackend Protocol."
         )
-    
+
+def classify_failure(exc: Exception) -> FailureKind:
+    """TRANSIENT = retry; DETERMINISTIC = error will reccur, don't bother."""
+    msg = str(exc).lower()
+    for pattern in _DETERMINISTIC_PATTERNS:
+        if pattern in msg:
+            return FailureKind.DETERMINISTIC
+    return FailureKind.TRANSIENT
+
+def backoff_seconds(retry_count: int) -> float:
+    """exponential backoff, capped at 8s."""
+    return min(8.0, 0.5 * (2 ** retry_count))
+
 class DistributedEvalCoordinator:
-    """Work-Stealing coordinator across a pool of EvalWorker actors."""
+    """Work-Stealing coordinator across a pool of EvalWorker actors. aggregator_cls."""
     def __init__(
-        self, n_workers: int, model_name: str = "distilgpt2",
+        self, n_workers: int, model_name: str = "distilgpt2", max_retries: int = 2,
         output_path: str = "results/results.jsonl", batch_size: int = 4,
         aggregator_cls=ResultsAggregator,
     ) -> None:
         self.n_workers = n_workers
         self.model_name = model_name
+        self.max_retries = max_retries
         self.output_path = output_path
         self.batch_size = batch_size
 
@@ -66,10 +89,16 @@ class DistributedEvalCoordinator:
             )
             done_ref = done_refs[0]
             worker_idx, batch = active.pop(done_ref)
-        
-            results: list[EvalResult] = ray.get(done_ref)
-            self._handle_success(results, aggregator)
-        
+
+            try:
+                results: list[EvalResult] = ray.get(done_ref)
+                self._handle_success(results, aggregator)
+            except Exception as exc:
+                self._handle_failure(
+                    exc=exc, batch=batch, worker_idx=worker_idx,
+                    workers=workers, aggregator=aggregator,
+                )
+
             self._assign_next(worker_idx, pending, submit)
         
         live_workers = [w for w in workers if w is not None]
@@ -86,7 +115,53 @@ class DistributedEvalCoordinator:
     
     def _handle_success(self, results: list[EvalResult], aggregator: object,) -> None:
         self._record(aggregator, results)
-    
+
+    def _handle_failure(
+        self, exc: Exception, batch: list[EvalTask], worker_idx: int,
+        workers: list, aggregator: object,) -> None:
+        """classify, then retry in place with backoff; record terminal failure when
+        the budget is exhausted."""
+        kind = classify_failure(exc)
+        logger.error(f"Batch failed on worker {worker_idx} ({kind.name}): {exc}")
+
+        task_max_retries = (
+            batch[0].max_retries
+            if batch[0].max_retries is not None
+            else self.max_retries
+        )
+        if kind == FailureKind.TRANSIENT:
+            for attempt in range(task_max_retries):
+                # Blocking: the whole scheduling loop waits out this sleep.
+                time.sleep(backoff_seconds(attempt))
+                logger.info(
+                    f"Retry {attempt + 1}/{task_max_retries} "
+                    f"for {len(batch)} tasks"
+                )
+                try:
+                    results = ray.get(
+                        workers[worker_idx].evaluate_batch.remote(batch)
+                    )
+                    self._handle_success(results, aggregator)
+                    return
+                except Exception as retry_exc:
+                    exc = retry_exc
+            kind = classify_failure(exc)
+
+        # Terminal failure: one EvalResult per task.
+        self._record(aggregator, [
+            EvalResult(
+                task_id=task.task_id, 
+                score=0.0, 
+                response="",
+                latency_seconds=0.0, 
+                failed=True, 
+                worker_id=worker_idx,
+                error=str(exc), 
+                failure_kind=kind,
+            )
+            for task in batch
+        ])
+
     def _assign_next(self, worker_idx: int, pending: deque, submit,) -> None:
         """Give freed worker its next batch, if any."""
         if pending:
