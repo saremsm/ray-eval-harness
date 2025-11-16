@@ -14,6 +14,12 @@ from worker import HFWorker
 
 logger = logging.getLogger(__name__)
 
+# Wall-clock threshold for treating a worker as hung.
+HUNG_WORKER_THRESHOLD_S = 240.0
+
+# Poll interval when no refs are completing.
+RETRY_POLL_INTERVAL = 1.0
+
 _DETERMINISTIC_PATTERNS = (
     "token indices sequence length",
     "index out of range",
@@ -69,46 +75,100 @@ class DistributedEvalCoordinator:
         pending: deque[list[EvalTask]] = deque(
             make_batches(tasks, self.batch_size)
         )
+        
         # ObjectRef -> (worker_index, batch)
         active: dict = {}
 
+        # Consecutive quiet-poll tallies per worker; zeroed on eviction.
+        timeout_counts: dict[int, int] = {i: 0 for i in range(self.n_workers)}
+
         def submit(worker_idx: int, batch: list[EvalTask]) -> None:
+            if workers[worker_idx] is None:
+                # Slot is dead; re-queue for another worker.
+                pending.append(batch)
+                return
             ref = workers[worker_idx].evaluate_batch.remote(batch)
             active[ref] = (worker_idx, batch)
         
         # Fill the pipeline: every live worker gets its first batch.
-        available = list(range(self.n_workers))
+        available = [i for i in range(self.n_workers) if workers[i] is not None]
         while pending and available:
             batch = pending.popleft()
             submit(available.pop(0), batch)
         
-        while active:
+        while active or pending:
+            if not active:
+                time.sleep(RETRY_POLL_INTERVAL)
+                continue
+
             done_refs, _ = ray.wait(
                 list(active.keys()),
                 num_returns=1,
+                timeout=RETRY_POLL_INTERVAL,
             )
-            done_ref = done_refs[0]
-            worker_idx, batch = active.pop(done_ref)
 
-            try:
-                results: list[EvalResult] = ray.get(done_ref)
-                self._handle_success(results, aggregator)
-            except Exception as exc:
-                self._handle_failure(
-                    exc=exc, batch=batch, worker_idx=worker_idx,
-                    workers=workers, aggregator=aggregator,
+            if done_refs:
+                done_ref = done_refs[0]
+                worker_idx, batch = active.pop(done_ref)
+
+                try:
+                    results: list[EvalResult] = ray.get(done_ref)
+                    self._handle_success(results, aggregator)
+                except Exception as exc:
+                    self._handle_failure(
+                        exc=exc,
+                        batch=batch,
+                        worker_idx=worker_idx,
+                        workers=workers,
+                        aggregator=aggregator,
+                    )
+
+                self._assign_next(worker_idx, pending, submit)
+            else:
+                # Scan every iteration, not only when ray.wait returns empty: under steady
+                # completions that gate starves exactly when the system is busiest.
+                self._handle_timeouts(
+                    active=active,
+                    timeout_counts=timeout_counts,
+                    workers=workers,
+                    pending=pending,
+                    submit=submit,
                 )
-
-            self._assign_next(worker_idx, pending, submit)
         
         live_workers = [w for w in workers if w is not None]
         worker_stats = ray.get([w.get_stats.remote() for w in live_workers])
         summary = ray.get(aggregator.get_summary.remote())
         summary["worker_stats"] = worker_stats
         return summary
-    
+
+    # Hung-worker handling
+    def _handle_timeouts(self, active: dict, timeout_counts: dict,
+        workers: list, pending: deque, submit,) -> None:
+        """tally consecutive quiet polls per worker; evict and replace a worker once
+        its tally crosses the threshold."""
+        limit = int(HUNG_WORKER_THRESHOLD_S / RETRY_POLL_INTERVAL)
+        for ref in list(active.keys()):
+            worker_idx, batch = active[ref]
+            timeout_counts[worker_idx] += 1
+            if timeout_counts[worker_idx] < limit:
+                continue
+
+            active.pop(ref)
+            logger.error(
+                f"Worker {worker_idx}: {timeout_counts[worker_idx]} quiet "
+                f"polls (~{HUNG_WORKER_THRESHOLD_S:.0f}s); replacing worker"
+            )
+            timeout_counts[worker_idx] = 0
+            pending.append(batch)
+
+            self._replace_worker(workers, worker_idx)
+
+            # Give the replacement its first batch right away if available.
+            if pending:
+                batch_to_send = pending.popleft()
+                submit(worker_idx, batch_to_send)
+
     # Helpers
-    
     def _record(self, aggregator: object, results: list[EvalResult]) -> None:
         for result in results:
             ray.get(aggregator.add_result.remote(result))
@@ -146,6 +206,7 @@ class DistributedEvalCoordinator:
                 except Exception as retry_exc:
                     exc = retry_exc
             kind = classify_failure(exc)
+        self._check_and_replace_if_poisoned(workers, worker_idx)
 
         # Terminal failure: one EvalResult per task.
         self._record(aggregator, [
@@ -161,6 +222,22 @@ class DistributedEvalCoordinator:
             )
             for task in batch
         ])
+
+    def _check_and_replace_if_poisoned(
+        self, workers: list, worker_idx: int,) -> None:
+        """health-check the worker; replace if poisoned or unresponsive."""
+        if workers[worker_idx] is None:
+            return
+        try:
+            is_healthy = ray.get(
+                workers[worker_idx].health_check.remote(),
+                timeout=5.0,
+            )
+        except Exception:
+            self._replace_worker(workers, worker_idx)
+            return
+        if not is_healthy:
+            self._replace_worker(workers, worker_idx)
 
     def _assign_next(self, worker_idx: int, pending: deque, submit,) -> None:
         """Give freed worker its next batch, if any."""
@@ -188,3 +265,42 @@ class DistributedEvalCoordinator:
         
         logger.info(f"All {self.n_workers} workers ready and validated")
         return workers
+    
+    def _replace_worker(
+        self,
+        workers: list,
+        failed_idx: int,
+        max_attempts: int = 3,
+    ) -> bool:
+        """replace a worker with bounded retries."""
+        # TODO: still blocks on model load. need standby pool for big models.
+        workers[failed_idx] = None  # nothing dispatches here while we work
+
+        logger.warning(f"Replacing worker {failed_idx}")
+
+        for attempt in range(max_attempts):
+            try:
+                new_worker = self._worker_cls.remote(
+                    worker_id=failed_idx,
+                    model_name=self.model_name,
+                )
+                ray.get(new_worker.health_check.remote(), timeout=120.0)
+                validate_backend(new_worker)
+                workers[failed_idx] = new_worker
+                logger.info(
+                    f"Replacement worker {failed_idx} ready "
+                    f"(attempt {attempt + 1}/{max_attempts})"
+                )
+                return True
+            except Exception as exc:
+                logger.error(
+                    f"Replacement attempt {attempt + 1}/{max_attempts} "
+                    f"for worker {failed_idx} failed: {exc}"
+                )
+                time.sleep(2.0 * (attempt + 1))
+
+        logger.error(
+            f"Worker {failed_idx} could not be replaced after {max_attempts} "
+            f"attempts. Marking slot dead; coordinator will skip it."
+        )
+        return False
