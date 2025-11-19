@@ -14,8 +14,8 @@ from worker import HFWorker
 
 logger = logging.getLogger(__name__)
 
-# Wall-clock threshold for treating a worker as hung.
-HUNG_WORKER_THRESHOLD_S = 240.0
+# Wall-clock threshold for treating an outstanding ref as hung.
+HUNG_REF_THRESHOLD_S = 240.0
 
 # Poll interval when no refs are completing.
 RETRY_POLL_INTERVAL = 1.0
@@ -79,8 +79,8 @@ class DistributedEvalCoordinator:
         # ObjectRef -> (worker_index, batch)
         active: dict = {}
 
-        # Consecutive quiet-poll tallies per worker; zeroed on eviction.
-        timeout_counts: dict[int, int] = {i: 0 for i in range(self.n_workers)}
+        # Per-ref submission timestamp; keyed by ref, not worker.
+        ref_timeouts: dict = {}
 
         def submit(worker_idx: int, batch: list[EvalTask]) -> None:
             if workers[worker_idx] is None:
@@ -89,6 +89,7 @@ class DistributedEvalCoordinator:
                 return
             ref = workers[worker_idx].evaluate_batch.remote(batch)
             active[ref] = (worker_idx, batch)
+            ref_timeouts[ref] = time.monotonic()
         
         # Fill the pipeline: every live worker gets its first batch.
         available = [i for i in range(self.n_workers) if workers[i] is not None]
@@ -110,6 +111,7 @@ class DistributedEvalCoordinator:
             if done_refs:
                 done_ref = done_refs[0]
                 worker_idx, batch = active.pop(done_ref)
+                ref_timeouts.pop(done_ref, None)
 
                 try:
                     results: list[EvalResult] = ray.get(done_ref)
@@ -129,7 +131,7 @@ class DistributedEvalCoordinator:
                 # completions that gate starves exactly when the system is busiest.
                 self._handle_timeouts(
                     active=active,
-                    timeout_counts=timeout_counts,
+                    ref_timeouts=ref_timeouts,
                     workers=workers,
                     pending=pending,
                     submit=submit,
@@ -142,23 +144,34 @@ class DistributedEvalCoordinator:
         return summary
 
     # Hung-worker handling
-    def _handle_timeouts(self, active: dict, timeout_counts: dict,
-        workers: list, pending: deque, submit,) -> None:
-        """tally consecutive quiet polls per worker; evict and replace a worker once
-        its tally crosses the threshold."""
-        limit = int(HUNG_WORKER_THRESHOLD_S / RETRY_POLL_INTERVAL)
+    def _handle_timeouts(
+        self,
+        active: dict,
+        ref_timeouts: dict,
+        workers: list,
+        pending: deque,
+        submit,
+    ) -> None:
+        """evict refs older than HUNG_REF_THRESHOLD_S, replace owning worker."""
+        now = time.monotonic()
+        # Snapshot before iterating: active is mutated during eviction.
         for ref in list(active.keys()):
-            worker_idx, batch = active[ref]
-            timeout_counts[worker_idx] += 1
-            if timeout_counts[worker_idx] < limit:
+            if ref not in active:
                 continue
 
-            active.pop(ref)
+            submitted_at = ref_timeouts.get(ref, now)
+            age = now - submitted_at
+            if age < HUNG_REF_THRESHOLD_S:
+                continue
+
+            worker_idx, batch = active.pop(ref)
+            ref_timeouts.pop(ref, None)
+
             logger.error(
-                f"Worker {worker_idx}: {timeout_counts[worker_idx]} quiet "
-                f"polls (~{HUNG_WORKER_THRESHOLD_S:.0f}s); replacing worker"
+                f"Worker {worker_idx}: ref outstanding for {age:.0f}s "
+                f"(threshold {HUNG_REF_THRESHOLD_S:.0f}s); replacing worker"
             )
-            timeout_counts[worker_idx] = 0
+
             pending.append(batch)
 
             self._replace_worker(workers, worker_idx)
