@@ -85,7 +85,71 @@ class HFWorker:
             ))
         
         return results
-    
+
+    def evaluate_with_hooks(
+        self,
+        task: EvalTask,
+        hooks: list,  # list[InterventionHook]
+    ) -> EvalResult:
+        """per-token hooks via TextIteratorStreamer; generation runs in a background thread."""
+        if self._poisoned:
+            raise RuntimeError(f"Worker {self.worker_id} poisoned, replace me")
+
+        from threading import Thread
+        from transformers import TextIteratorStreamer
+
+        tokenizer = self._pipeline.tokenizer
+        model = self._pipeline.model
+        inputs = tokenizer(task.prompt, return_tensors="pt").to(model.device)
+        streamer = TextIteratorStreamer(
+            tokenizer, skip_prompt=True, skip_special_tokens=True
+        )
+
+        thread = Thread(
+            target=model.generate,
+            kwargs=dict(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                pad_token_id=tokenizer.eos_token_id,
+                streamer=streamer,
+            ),
+            daemon=True,
+        )
+
+        start = time.perf_counter()
+        thread.start()
+
+        accumulated = ""
+        stopped_early = False
+        token_count = 0
+        for delta in streamer:
+            if not delta:
+                continue
+            accumulated += delta
+            token_count += 1
+            for hook in hooks:
+                hook.on_delta(delta, accumulated)
+            if any(hook.should_stop(accumulated) for hook in hooks):
+                stopped_early = True
+                break
+
+        elapsed = time.perf_counter() - start
+        response = accumulated
+        score, condition_scores = self._scorer.score(response, task)
+        self.tasks_completed += 1
+
+        return EvalResult(
+            task_id=task.task_id,
+            score=score,
+            response=response,
+            latency_seconds=elapsed,
+            hooked=True,
+            worker_id=self.worker_id,
+            condition_scores=condition_scores,
+            tokens_generated=token_count,
+            stopped_early=stopped_early,
+        )
+
     def health_check(self) -> bool:
         """True if not poisoned."""
         return not self._poisoned
@@ -170,7 +234,18 @@ class VLLMWorker:
                 tokens_generated=len(completion.token_ids),
             ))
         return results
-
+    
+    def evaluate_with_hooks(
+        self,
+        task: EvalTask,
+        hooks: list,  # list[InterventionHook]
+    ) -> EvalResult:
+        """not supported: synchronous LLM.generate returns only terminal outputs."""
+        raise NotImplementedError(
+            "vLLM backend does not support hooks: synchronous generate has "
+            "no per-token hook point"
+        )
+        
     def health_check(self) -> bool:
         return True
 

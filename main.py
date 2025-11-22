@@ -9,6 +9,8 @@ import ray
 
 from coordinator import DistributedEvalCoordinator
 from types_ import EvalTask, ScoringCondition
+from hooks import EarlyStoppingHook, LoggingHook
+from worker import HFWorker
 
 logging.basicConfig(level=logging.INFO, 
     format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S",)
@@ -154,11 +156,52 @@ def print_summary(summary: dict, wall_elapsed: float) -> None:
                 f"{'yes' if ws['poisoned'] else 'no':>10}"
             )
     print(f"{'=' * width}\n")
+    
+def run_hooked_demo(model_name: str) -> None:
+    """Single-task hook demo."""
+    print("\n" + "=" * 62)
+    print("  Mid-generation intervention demo (hooked evaluation)")
+    print("=" * 62)
+
+    worker = HFWorker.remote(
+        worker_id=99,
+        model_name=model_name,
+    )
+    ray.get(worker.health_check.remote())
+
+    task = EvalTask(
+        task_id="hook_demo",
+        prompt="The capital of France is",
+        expected_answer="Paris",
+        conditions=list(_CONDITIONS),
+    )
+
+    stop_hook = EarlyStoppingHook(triggers=["Paris", "paris"])
+    # INFO level so the per-token lines are visible under the default logging
+    log_hook = LoggingHook(
+        task_id=task.task_id, log_every_n=1, level=logging.INFO
+    )
+
+    print(f"  Prompt:          '{task.prompt}'")
+    print(f"  Expected answer: '{task.expected_answer}'")
+    print(f"  Hook:            stop as soon as 'Paris' appears\n")
+
+    result = ray.get(
+        worker.evaluate_with_hooks.remote(task, [stop_hook, log_hook])
+    )
+
+    print(f"  Response:        {result.response!r}")
+    print(f"  Score:           {result.score:.3f}")
+    print(f"  Tokens generated:{result.tokens_generated}")
+    print(f"  Stopped early:   {result.stopped_early}")
+    if stop_hook.triggered_by:
+        print(f"  Triggered by:    {stop_hook.triggered_by!r}")
+    print("=" * 62 + "\n")
 
 # Entry Point
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Distributed LLM eval harness."
+        description="Distributed LLM eval harness with intervention hooks."
     )
     parser.add_argument(
         "--tasks", type=int, default=20,
@@ -176,6 +219,10 @@ def main() -> None:
         "--dry-run", action="store_true", dest="dry_run",
         help="Run 3 tasks across 2 workers for quick verification",
     )
+    parser.add_argument(
+        "--hook", action="store_true",
+        help="Run the mid-generation intervention demo after batch eval",
+    )                    
     parser.add_argument(
         "--output", type=str, default="results/results.jsonl",
         help="Path for JSONL results (default: results/results.jsonl)",
@@ -212,6 +259,7 @@ def main() -> None:
     summary = coordinator.run(tasks)
     wall_elapsed = time.perf_counter() - wall_start
     print_summary(summary, wall_elapsed)
+    if args.hook: run_hooked_demo(args.model)
     ray.shutdown()
     
 if __name__ == "__main__":

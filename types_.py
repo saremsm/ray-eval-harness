@@ -38,10 +38,12 @@ class EvalResult:
     latency_seconds: float
     worker_id: int
     failed: bool = False
+    hooked: bool = False
     error: Optional[str] = None
     failure_kind: Optional[FailureKind] = None
     condition_scores: dict[str, float] = field(default_factory=dict)
     tokens_generated: int = 0
+    stopped_early: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -55,6 +57,7 @@ class EvalResult:
             "response": self.response,
             "latency_seconds": self.latency_seconds,
             "failed": self.failed,
+            "hooked": self.hooked,
             "worker_id": self.worker_id,
             "error": self.error,
             "failure_kind": (
@@ -62,7 +65,19 @@ class EvalResult:
             ),
             "condition_scores": self.condition_scores,
             "tokens_generated": self.tokens_generated,
+            "stopped_early": self.stopped_early,
         }
+    
+class InterventionHook(Protocol):
+    """Per-step callback for generation."""
+
+    def on_delta(self, delta: str, accumulated: str) -> None:
+        """Called after each generation step. delta = new text since prev call."""
+        ...
+
+    def should_stop(self, accumulated: str) -> bool:
+        """Return True to halt. Sets stopped_early=True on result."""
+        ...
 
 # EvalBackend Protocol
 @runtime_checkable
