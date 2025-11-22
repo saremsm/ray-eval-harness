@@ -99,3 +99,87 @@ class HFWorker:
             "failed": self.tasks_failed,
             "poisoned": self._poisoned,
         }
+    
+# vLLM Backend
+@ray.remote(num_gpus=1)
+class VLLMWorker:
+    """vLLM worker: whole-GPU claim, synchronous LLM.generate."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        model_name: str,
+        max_new_tokens: int = MAX_NEW_TOKENS,
+        tensor_parallel_size: int = 1,
+    ) -> None:
+        self.worker_id = worker_id
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        self.tensor_parallel_size = tensor_parallel_size
+        self.tasks_completed = 0
+        self.tasks_failed = 0
+        self._scorer = RubricScorer()
+
+        logger.info(
+            f"Worker {worker_id}: loading '{model_name}' "
+            f"(vLLM, tp={tensor_parallel_size})..."
+        )
+
+        from vllm import LLM, SamplingParams
+
+        self._llm = LLM(
+            model=model_name,
+            dtype="auto",
+            tensor_parallel_size=tensor_parallel_size,
+        )
+        # Greedy decoding: outputs stable run-to-run. 
+        # Continuous batching doesn't guarantee bitwise determinism across batch.
+        self._sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+        )
+
+        logger.info(f"Worker {worker_id}: ready")
+
+    def evaluate_batch(self, tasks: list[EvalTask]) -> list[EvalResult]:
+        prompts = [task.prompt for task in tasks]
+
+        start = time.perf_counter()
+        try:
+            outputs = self._llm.generate(prompts, self._sampling_params)
+        except Exception:
+            self.tasks_failed += len(tasks)
+            raise
+
+        batch_latency = time.perf_counter() - start
+        estimated_per_task = batch_latency / len(tasks)
+
+        results = []
+        for task, output in zip(tasks, outputs):
+            completion = output.outputs[0]
+            response = completion.text
+            score, condition_scores = self._scorer.score(response, task)
+            self.tasks_completed += 1
+            results.append(EvalResult(
+                task_id=task.task_id,
+                score=score,
+                response=response,
+                latency_seconds=estimated_per_task,
+                worker_id=self.worker_id,
+                condition_scores=condition_scores,
+                tokens_generated=len(completion.token_ids),
+            ))
+        return results
+
+    def health_check(self) -> bool:
+        return True
+
+    def get_stats(self) -> dict:
+        return {
+            "worker_id": self.worker_id,
+            "model": self.model_name,
+            "backend": "vllm",
+            "completed": self.tasks_completed,
+            "failed": self.tasks_failed,
+            "poisoned": False,
+        }

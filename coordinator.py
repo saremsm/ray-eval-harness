@@ -10,7 +10,7 @@ from aggregator import ResultsAggregator
 from types_ import EvalResult, EvalTask, FailureKind
 
 from utils import make_batches
-from worker import HFWorker
+from worker import HFWorker, VLLMWorker
 
 logger = logging.getLogger(__name__)
 
@@ -50,18 +50,22 @@ def backoff_seconds(retry_count: int) -> float:
 class DistributedEvalCoordinator:
     """Work-Stealing coordinator across a pool of EvalWorker actors. aggregator_cls."""
     def __init__(
-        self, n_workers: int, model_name: str = "distilgpt2", max_retries: int = 2,
+        self, n_workers: int, model_name: str = "distilgpt2", backend: str = "hf", 
+        max_retries: int = 2,
         output_path: str = "results/results.jsonl", batch_size: int = 4,
         aggregator_cls=ResultsAggregator,
     ) -> None:
         self.n_workers = n_workers
+        self.backend = backend
         self.model_name = model_name
         self.max_retries = max_retries
         self.output_path = output_path
         self.batch_size = batch_size
 
         self._aggregator_cls = aggregator_cls
-        self._worker_cls = HFWorker
+        self._worker_cls = (
+            VLLMWorker if backend == "vllm" else HFWorker
+        )
     
     # Public Interface
 
@@ -261,7 +265,8 @@ class DistributedEvalCoordinator:
     def _create_workers(self) -> list:
         logger.info(
             f"Creating {self.n_workers} workers "
-            f"(model={self.model_name}, batch_size={self.batch_size})..."
+            f"(backend={self.backend}, model={self.model_name}, "
+            f"batch_size={self.batch_size})..."
         )
         workers = [
             self._worker_cls.remote(

@@ -1,3 +1,4 @@
 ray[default]>=2.50.0
+vllm>=0.15.0
 transformers>=4.56.0
 pytest>=7.0.0

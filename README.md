@@ -13,7 +13,7 @@ Ray-based eval harness for LLMs. Schedules batches of completion tasks across a 
               +---------------------+--------------------+
               |                     |                    |
         +-----v-----+         +-----v-----+        +-----v-----+
-        |EvalWorker |         |EvalWorker |        |EvalWorker |
+        |HFWorker   |         |VLLMWorker |        |HFWorker |
         |  (actor)  |         |  (actor)  |        |  (actor)  |
         +-----+-----+         +-----+-----+        +-----+-----+
               |                     |                    |
@@ -38,6 +38,10 @@ python main.py --dry-run
 
 # Larger run on CPU
 python main.py --tasks 200 --workers 4
+
+# vLLM run (requires GPU + a vLLM-compatible model)
+python main.py --tasks 1000 --workers 1 --backend vllm \
+    --model Qwen/Qwen2.5-1.5B
 ```
 
 ## Testing
