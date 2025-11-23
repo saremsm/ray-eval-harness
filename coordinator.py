@@ -70,7 +70,9 @@ class DistributedEvalCoordinator:
     # Public Interface
 
     def run(self, tasks: list[EvalTask]) -> dict:
-        """run all tasks, return summary+worker_stats. results stream to JSONL"""
+        """run all tasks, return summary+worker_stats. results stream to JSONL non-
+        blocking retry: failed batch -> deferred[] with wake-up time. back to
+        pending[] when time hits. main loop keeps draining"""
         workers = self._create_workers()
         aggregator = self._aggregator_cls.remote( 
             total_tasks=len(tasks), output_path=self.output_path,
@@ -79,21 +81,40 @@ class DistributedEvalCoordinator:
         pending: deque[list[EvalTask]] = deque(
             make_batches(tasks, self.batch_size)
         )
-        
-        # ObjectRef -> (worker_index, batch)
+
+        # Scheduled for a future wake-up. (ready_at, batch, retry_count).
+        deferred: deque[tuple[float, list[EvalTask], int]] = deque()
+
+        # ObjectRef -> (worker_index, batch, retry_count)
         active: dict = {}
 
         # Per-ref submission timestamp; keyed by ref, not worker.
         ref_timeouts: dict = {}
 
-        def submit(worker_idx: int, batch: list[EvalTask]) -> None:
+        def submit(
+            worker_idx: int,
+            batch: list[EvalTask],
+            retry_count: int = 0,
+        ) -> None:
             if workers[worker_idx] is None:
                 # Slot is dead; re-queue for another worker.
                 pending.append(batch)
                 return
             ref = workers[worker_idx].evaluate_batch.remote(batch)
-            active[ref] = (worker_idx, batch)
+            active[ref] = (worker_idx, batch, retry_count)
             ref_timeouts[ref] = time.monotonic()
+
+        def promote_ready_retries() -> None:
+            """Move deferred batches whose wake-up has arrived into pending."""
+            now = time.monotonic()
+            still_waiting: list[tuple[float, list[EvalTask], int]] = []
+            for ready_at, batch, retry_count in deferred:
+                if ready_at <= now:
+                    pending.append(batch)
+                else:
+                    still_waiting.append((ready_at, batch, retry_count))
+            deferred.clear()
+            deferred.extend(still_waiting)
         
         # Fill the pipeline: every live worker gets its first batch.
         available = [i for i in range(self.n_workers) if workers[i] is not None]
@@ -101,8 +122,11 @@ class DistributedEvalCoordinator:
             batch = pending.popleft()
             submit(available.pop(0), batch)
         
-        while active or pending:
+        while active or deferred:
+            promote_ready_retries()
+
             if not active:
+                # Everything in flight has drained and we're only waiting on a deferred retry.
                 time.sleep(RETRY_POLL_INTERVAL)
                 continue
 
@@ -114,20 +138,25 @@ class DistributedEvalCoordinator:
 
             if done_refs:
                 done_ref = done_refs[0]
-                worker_idx, batch = active.pop(done_ref)
+                worker_idx, batch, retry_count = active.pop(done_ref)
                 ref_timeouts.pop(done_ref, None)
 
                 try:
                     results: list[EvalResult] = ray.get(done_ref)
                     self._handle_success(results, aggregator)
                 except Exception as exc:
-                    self._handle_failure(
+                    should_retry = self._handle_failure(
                         exc=exc,
                         batch=batch,
                         worker_idx=worker_idx,
+                        retry_count=retry_count,
                         workers=workers,
                         aggregator=aggregator,
                     )
+                    if should_retry:
+                        # Non-blocking: schedule for later, free the worker now.
+                        ready_at = time.monotonic() + backoff_seconds(retry_count)
+                        deferred.append((ready_at, batch, retry_count + 1))
 
                 self._assign_next(worker_idx, pending, submit)
             else:
@@ -168,7 +197,7 @@ class DistributedEvalCoordinator:
             if age < HUNG_REF_THRESHOLD_S:
                 continue
 
-            worker_idx, batch = active.pop(ref)
+            worker_idx, batch, retry_count = active.pop(ref)
             ref_timeouts.pop(ref, None)
 
             logger.error(
@@ -194,10 +223,15 @@ class DistributedEvalCoordinator:
         self._record(aggregator, results)
 
     def _handle_failure(
-        self, exc: Exception, batch: list[EvalTask], worker_idx: int,
-        workers: list, aggregator: object,) -> None:
-        """classify, then retry in place with backoff; record terminal failure when
-        the budget is exhausted."""
+        self,
+        exc: Exception,
+        batch: list[EvalTask],
+        worker_idx: int,
+        retry_count: int,
+        workers: list,
+        aggregator: object,
+    ) -> bool:
+        """returns True if batch should retry."""
         kind = classify_failure(exc)
         logger.error(f"Batch failed on worker {worker_idx} ({kind.name}): {exc}")
 
@@ -206,39 +240,35 @@ class DistributedEvalCoordinator:
             if batch[0].max_retries is not None
             else self.max_retries
         )
-        if kind == FailureKind.TRANSIENT:
-            for attempt in range(task_max_retries):
-                # Blocking: the whole scheduling loop waits out this sleep.
-                time.sleep(backoff_seconds(attempt))
-                logger.info(
-                    f"Retry {attempt + 1}/{task_max_retries} "
-                    f"for {len(batch)} tasks"
-                )
-                try:
-                    results = ray.get(
-                        workers[worker_idx].evaluate_batch.remote(batch)
-                    )
-                    self._handle_success(results, aggregator)
-                    return
-                except Exception as retry_exc:
-                    exc = retry_exc
-            kind = classify_failure(exc)
+        should_retry = (
+            kind == FailureKind.TRANSIENT
+            and retry_count < task_max_retries
+        )
+        if should_retry:
+            logger.info(
+                f"Scheduling retry {retry_count + 1}/{task_max_retries} "
+                f"for {len(batch)} tasks "
+                f"(backoff: {backoff_seconds(retry_count):.1f}s)"
+            )
+            return True
+
         self._check_and_replace_if_poisoned(workers, worker_idx)
 
         # Terminal failure: one EvalResult per task.
         self._record(aggregator, [
             EvalResult(
-                task_id=task.task_id, 
-                score=0.0, 
+                task_id=task.task_id,
+                score=0.0,
                 response="",
-                latency_seconds=0.0, 
-                failed=True, 
+                latency_seconds=0.0,
+                failed=True,
                 worker_id=worker_idx,
-                error=str(exc), 
+                error=str(exc),
                 failure_kind=kind,
             )
             for task in batch
         ])
+        return False
 
     def _check_and_replace_if_poisoned(
         self, workers: list, worker_idx: int,) -> None:
