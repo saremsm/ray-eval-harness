@@ -97,7 +97,7 @@ class DistributedEvalCoordinator:
             retry_count: int = 0,
         ) -> None:
             if workers[worker_idx] is None:
-                # Slot is dead; re-queue for another worker.
+                # Slot is dead; re-queue so dispatch_pending_to_idle picks it up.
                 pending.append(batch)
                 return
             ref = workers[worker_idx].evaluate_batch.remote(batch)
@@ -115,15 +115,30 @@ class DistributedEvalCoordinator:
                     still_waiting.append((ready_at, batch, retry_count))
             deferred.clear()
             deferred.extend(still_waiting)
-        
-        # Fill the pipeline: every live worker gets its first batch.
+
+        def dispatch_pending_to_idle() -> None:
+            """Hand pending work to idle workers - a deferred retry can promote back
+            to pending after every worker has gone idle."""
+            if not pending:
+                return
+            busy = {worker_idx for worker_idx, _, _ in active.values()}
+            for i in range(self.n_workers):
+                if not pending:
+                    return
+                if workers[i] is None or i in busy:
+                    continue
+                batch_to_send = pending.popleft()
+                submit(i, batch_to_send)
+
+        # Fill the pipeline
         available = [i for i in range(self.n_workers) if workers[i] is not None]
         while pending and available:
             batch = pending.popleft()
             submit(available.pop(0), batch)
         
-        while active or deferred:
+        while active or deferred or pending:
             promote_ready_retries()
+            dispatch_pending_to_idle()
 
             if not active:
                 # Everything in flight has drained and we're only waiting on a deferred retry.

@@ -414,7 +414,7 @@ class TestCoordinatorIntegration:
         assert summary["succeeded"] == 8
         assert summary["failed"] == 0
 
-    @pytest.mark.xfail(reason="deferred queue loses in-flight retries until idle promotion lands (next commit)")
+
     def test_transient_failure_is_retried_and_succeeds(self, patched_ray):
         # Worker 0 fails on first call, then succeeds. Worker 1 is always healthy.
         coord, tasks = _coordinator_with_fake_workers(
