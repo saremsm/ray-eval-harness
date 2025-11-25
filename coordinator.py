@@ -77,9 +77,9 @@ class DistributedEvalCoordinator:
         aggregator = self._aggregator_cls.remote( 
             total_tasks=len(tasks), output_path=self.output_path,
         )
-        # deque for O(1) popleft; pop(0) on a list is O(n).
-        pending: deque[list[EvalTask]] = deque(
-            make_batches(tasks, self.batch_size)
+        # Ready to dispatch.
+        pending: deque[tuple[list[EvalTask], int]] = deque(
+            (batch, 0) for batch in make_batches(tasks, self.batch_size)
         )
 
         # Scheduled for a future wake-up. (ready_at, batch, retry_count).
@@ -98,7 +98,7 @@ class DistributedEvalCoordinator:
         ) -> None:
             if workers[worker_idx] is None:
                 # Slot is dead; re-queue so dispatch_pending_to_idle picks it up.
-                pending.append(batch)
+                pending.append((batch, retry_count))
                 return
             ref = workers[worker_idx].evaluate_batch.remote(batch)
             active[ref] = (worker_idx, batch, retry_count)
@@ -110,7 +110,7 @@ class DistributedEvalCoordinator:
             still_waiting: list[tuple[float, list[EvalTask], int]] = []
             for ready_at, batch, retry_count in deferred:
                 if ready_at <= now:
-                    pending.append(batch)
+                    pending.append((batch, retry_count))
                 else:
                     still_waiting.append((ready_at, batch, retry_count))
             deferred.clear()
@@ -127,14 +127,14 @@ class DistributedEvalCoordinator:
                     return
                 if workers[i] is None or i in busy:
                     continue
-                batch_to_send = pending.popleft()
-                submit(i, batch_to_send)
+                batch_to_send, rc = pending.popleft()
+                submit(i, batch_to_send, rc)
 
         # Fill the pipeline
         available = [i for i in range(self.n_workers) if workers[i] is not None]
         while pending and available:
-            batch = pending.popleft()
-            submit(available.pop(0), batch)
+            batch, retry_count = pending.popleft()
+            submit(available.pop(0), batch, retry_count)
         
         while active or deferred or pending:
             promote_ready_retries()
@@ -220,14 +220,14 @@ class DistributedEvalCoordinator:
                 f"(threshold {HUNG_REF_THRESHOLD_S:.0f}s); replacing worker"
             )
 
-            pending.append(batch)
+            pending.append((batch, retry_count + 1))
 
             self._replace_worker(workers, worker_idx)
 
             # Give the replacement its first batch right away if available.
             if pending:
-                batch_to_send = pending.popleft()
-                submit(worker_idx, batch_to_send)
+                batch_to_send, rc = pending.popleft()
+                submit(worker_idx, batch_to_send, rc)
 
     # Helpers
     def _record(self, aggregator: object, results: list[EvalResult]) -> None:
@@ -304,8 +304,8 @@ class DistributedEvalCoordinator:
     def _assign_next(self, worker_idx: int, pending: deque, submit,) -> None:
         """Give freed worker its next batch, if any."""
         if pending:
-            batch = pending.popleft()
-            submit(worker_idx, batch)
+            batch, retry_count = pending.popleft()
+            submit(worker_idx, batch, retry_count)
     
     def _create_workers(self) -> list:
         logger.info(

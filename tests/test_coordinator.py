@@ -79,6 +79,46 @@ class TestClassifyFailure:
             IndexError("index out of range")
         ) == FailureKind.DETERMINISTIC
 
+class TestAssignNext:
+    def test_submits_with_correct_retry_count(self):
+        """retry_count from tuple must reach submit(), not default of 0."""
+        coord = make_coordinator()
+        submitted = []
+
+        def mock_submit(widx, batch, retry_count=0):
+            submitted.append((widx, batch, retry_count))
+
+        batch = [make_task("t0")]
+        # pending stores tuples; retry_count=1 simulates a re-queued batch.
+        pending = deque([(batch, 1)])
+        coord._assign_next(0, pending, mock_submit)
+
+        assert len(submitted) == 1
+        _, submitted_batch, submitted_rc = submitted[0]
+        assert submitted_batch == batch
+        assert submitted_rc == 1, (
+            f"Expected retry_count=1 (from tuple), got {submitted_rc}. "
+            "_assign_next must unpack the tuple, not use the default."
+        )
+        assert len(pending) == 0
+
+    def test_idle_when_pending_empty(self):
+        coord = make_coordinator()
+        submitted = []
+        coord._assign_next(0, deque(), lambda *a, **k: submitted.append(1))
+        assert submitted == []
+
+    def test_worker_idx_passed_through(self):
+        coord = make_coordinator()
+        submitted = []
+        pending = deque([([make_task()], 0)])
+        coord._assign_next(
+            7, pending,
+            lambda widx, *a, **k: submitted.append(widx),
+        )
+        assert submitted[0] == 7
+
+
 # Handle Timeouts
 class TestHandleTimeouts:
     """Tests use direct timestamp manipulation rather than monkeypatching."""
@@ -124,6 +164,37 @@ class TestHandleTimeouts:
         assert ref not in active, "Old ref must be removed from active"
         assert ref not in ref_timeouts, (
             "Old ref must be removed from ref_timeouts on eviction"
+        )
+        
+    def test_evicted_batch_requeued_with_incremented_retry_count(self):
+        coord = self._make_coord(max_retries=2)
+        ref = _Ref("r0")
+        batch = [make_task("t0")]
+        active = {ref: (0, batch, 0)}
+        ref_timeouts = {ref: time.monotonic() - HUNG_REF_THRESHOLD_S - 1.0}
+        pending = deque()
+        submitted = []
+
+        def capture_submit(widx, b, retry_count=0):
+            submitted.append((widx, b, retry_count))
+
+        coord._handle_timeouts(
+            active=active,
+            ref_timeouts=ref_timeouts,
+            workers=[_FakeWorker()],
+            pending=pending,
+            submit=capture_submit,
+        )
+
+        assert len(submitted) == 1, (
+            "Expected exactly one submit call (re-queued batch immediately "
+            f"consumed because pending was empty). Got: {submitted}"
+        )
+        _, submitted_batch, submitted_retry = submitted[0]
+        assert submitted_batch == batch
+        assert submitted_retry == 1, (
+            f"retry_count must be 0 + 1 = 1, got {submitted_retry}. "
+            "Hung timeouts must consume the retry budget."
         )
 
     def test_ages_independent_across_refs(self):
@@ -433,7 +504,6 @@ class TestCoordinatorIntegration:
         assert summary["succeeded"] == 8
         assert summary["failed"] == 0
 
-    @pytest.mark.xfail(reason="retry_count lost on requeue until tuple threading lands (two commits ahead)")
     def test_retry_exhaustion_records_failed_results(self, patched_ray):
         # Every call on worker 0 raises. Worker 1 succeeds.
         #   max_retries=1, worker 0's batch lands in failed bucket
