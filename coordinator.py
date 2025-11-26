@@ -50,14 +50,18 @@ def backoff_seconds(retry_count: int) -> float:
 class DistributedEvalCoordinator:
     """Work-Stealing coordinator across a pool of EvalWorker actors. aggregator_cls."""
     def __init__(
-        self, n_workers: int, model_name: str = "distilgpt2", backend: str = "hf", 
+        self,
+        n_workers: int,
+        model_name: str = "distilgpt2",
+        backend: str = "hf",
         max_retries: int = 2,
-        output_path: str = "results/results.jsonl", batch_size: int = 4,
+        output_path: str = "results/results.jsonl",
+        batch_size: int = 4,
         aggregator_cls=ResultsAggregator,
     ) -> None:
         self.n_workers = n_workers
-        self.backend = backend
         self.model_name = model_name
+        self.backend = backend
         self.max_retries = max_retries
         self.output_path = output_path
         self.batch_size = batch_size
@@ -183,6 +187,7 @@ class DistributedEvalCoordinator:
                     workers=workers,
                     pending=pending,
                     submit=submit,
+                    aggregator=aggregator,
                 )
         
         live_workers = [w for w in workers if w is not None]
@@ -199,6 +204,7 @@ class DistributedEvalCoordinator:
         workers: list,
         pending: deque,
         submit,
+        aggregator: object,
     ) -> None:
         """evict refs older than HUNG_REF_THRESHOLD_S, replace owning worker."""
         now = time.monotonic()
@@ -220,7 +226,39 @@ class DistributedEvalCoordinator:
                 f"(threshold {HUNG_REF_THRESHOLD_S:.0f}s); replacing worker"
             )
 
-            pending.append((batch, retry_count + 1))
+            task_max_retries = (
+                batch[0].max_retries
+                if batch[0].max_retries is not None
+                else self.max_retries
+            )
+            if retry_count < task_max_retries:
+                pending.append((batch, retry_count + 1))
+                logger.info(
+                    f"Re-queued {len(batch)} tasks "
+                    f"(retry_count now {retry_count + 1}, "
+                    f"max {task_max_retries})"
+                )
+            else:
+                logger.error(
+                    f"Batch hung {retry_count + 1} time(s); retry budget "
+                    f"exhausted - recording {len(batch)} terminal failures"
+                )
+                self._record(aggregator, [
+                    EvalResult(
+                        task_id=task.task_id,
+                        score=0.0,
+                        response="",
+                        latency_seconds=0.0,
+                        failed=True,
+                        worker_id=worker_idx,
+                        error=(
+                            f"batch hung >= {HUNG_REF_THRESHOLD_S:.0f}s "
+                            f"{retry_count + 1} time(s); retry budget exhausted"
+                        ),
+                        failure_kind=FailureKind.TRANSIENT,
+                    )
+                    for task in batch
+                ])
 
             self._replace_worker(workers, worker_idx)
 

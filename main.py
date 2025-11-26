@@ -216,6 +216,13 @@ def main() -> None:
         help="HuggingFace model name (default: distilgpt2)",
     )
     parser.add_argument(
+        "--backend", type=str, default="hf",
+        choices=["hf", "vllm"],
+        help="Inference backend: hf (transformers pipeline, CPU-friendly) "
+        "or vllm (GPU engine with continuous batching). "
+        "Default: hf",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", dest="dry_run",
         help="Run 3 tasks across 2 workers for quick verification",
     )
@@ -248,11 +255,13 @@ def main() -> None:
     coordinator = DistributedEvalCoordinator(
         n_workers=args.workers,
         model_name=args.model,
+        backend=args.backend,
         output_path=args.output,
     )
 
-    logger.info(f"Starting: {args.tasks} tasks, {args.workers} workers, "
-        f"model={args.model}"
+    logger.info(
+        f"Starting: tasks={args.tasks}, workers={args.workers}, "
+        f"backend={args.backend}, model={args.model}"
     )
 
     wall_start = time.perf_counter()

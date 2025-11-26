@@ -1,5 +1,6 @@
 import time
 import pytest
+from types import SimpleNamespace
 from unittest.mock import patch
 from collections import deque
 
@@ -37,6 +38,14 @@ class _FakeWorker:
     def evaluate_batch(self, tasks): pass
     def health_check(self): return True
     def get_stats(self): return {}
+
+class _CapturingAggregator:
+    """records add_result payloads."""
+    def __init__(self):
+        self.results = []
+        self.add_result = SimpleNamespace(
+            remote=lambda r: (self.results.append(r), r)[1]
+        )
 
 # Validate Backend
 class TestValidateBackend:
@@ -135,16 +144,20 @@ class TestHandleTimeouts:
         active = {ref: (0, batch, 0)}
         ref_timeouts = {ref: time.monotonic()}
 
+        agg = _CapturingAggregator()        
+
         coord._handle_timeouts(
             active=active,
             ref_timeouts=ref_timeouts,
             workers=[_FakeWorker()],
             pending=deque(),
             submit=lambda *a, **k: None,
+            aggregator=agg,
         )
 
         assert ref in active, "Recent ref must not be evicted"
         assert ref in ref_timeouts, "Recent ref's timestamp must be retained"
+        assert agg.results == []
 
     def test_old_ref_evicted(self):
         coord = self._make_coord()
@@ -153,19 +166,23 @@ class TestHandleTimeouts:
         active = {ref: (0, batch, 0)}
         ref_timeouts = {ref: time.monotonic() - HUNG_REF_THRESHOLD_S - 1.0}
 
+        agg = _CapturingAggregator()
+
         coord._handle_timeouts(
             active=active,
             ref_timeouts=ref_timeouts,
             workers=[_FakeWorker()],
             pending=deque(),
             submit=lambda *a, **k: None,
+            aggregator=agg,
         )
 
         assert ref not in active, "Old ref must be removed from active"
         assert ref not in ref_timeouts, (
             "Old ref must be removed from ref_timeouts on eviction"
         )
-        
+        assert agg.results == []
+
     def test_evicted_batch_requeued_with_incremented_retry_count(self):
         coord = self._make_coord(max_retries=2)
         ref = _Ref("r0")
@@ -178,12 +195,14 @@ class TestHandleTimeouts:
         def capture_submit(widx, b, retry_count=0):
             submitted.append((widx, b, retry_count))
 
+        agg = _CapturingAggregator()
         coord._handle_timeouts(
             active=active,
             ref_timeouts=ref_timeouts,
             workers=[_FakeWorker()],
             pending=pending,
             submit=capture_submit,
+            aggregator=agg,
         )
 
         assert len(submitted) == 1, (
@@ -196,10 +215,48 @@ class TestHandleTimeouts:
             f"retry_count must be 0 + 1 = 1, got {submitted_retry}. "
             "Hung timeouts must consume the retry budget."
         )
+        assert agg.results == []
+
+    def test_hang_budget_exhaustion_records_terminal_failures(self):
+        """Hang past max_retries => recorded terminal failure, not re-queued.
+        Regression: retry_count incremented on the hang path but never checked;
+        an always-hanging batch looped forever."""
+        coord = self._make_coord(max_retries=2)
+        agg = _CapturingAggregator()
+        ref = _Ref("r0")
+        batch = [make_task("t0"), make_task("t1")]
+        # retry_count == max_retries: the budget is spent.
+        active = {ref: (0, batch, 2)}
+        ref_timeouts = {ref: time.monotonic() - HUNG_REF_THRESHOLD_S - 1.0}
+        pending = deque()
+        submitted = []
+
+        with patch.object(coord_mod.ray, "get", lambda r, timeout=None: r):
+            coord._handle_timeouts(
+                active=active,
+                ref_timeouts=ref_timeouts,
+                workers=[_FakeWorker()],
+                pending=pending,
+                submit=lambda widx, b, retry_count=0: submitted.append(b),
+                aggregator=agg,
+            )
+
+        assert ref not in active
+        assert submitted == [], (
+            "Budget-exhausted batch must NOT be re-submitted"
+        )
+        assert len(pending) == 0
+        assert len(agg.results) == 2, (
+            "One terminal EvalResult per task in the hung batch"
+        )
+        assert all(r.failed for r in agg.results)
+        assert all("retry budget exhausted" in r.error for r in agg.results)
+
 
     def test_ages_independent_across_refs(self):
         """One old ref must not cause young refs to be evicted in the same call."""
         coord = self._make_coord()
+        agg = _CapturingAggregator()
         ref_old = _Ref("old")
         ref_young = _Ref("young")
         batch_old = [make_task("t_old")]
@@ -222,6 +279,7 @@ class TestHandleTimeouts:
             workers=workers,
             pending=deque(),
             submit=lambda *a, **k: None,
+            aggregator=agg,
         )
 
         assert ref_old not in active
@@ -239,20 +297,22 @@ class TestHandleTimeouts:
         pending: deque = deque()
         submitted = []
 
+        agg = _CapturingAggregator()
         coord._handle_timeouts(
             active=active,
             ref_timeouts=ref_timeouts,
             workers=[_FakeWorker()],
             pending=pending,
             submit=lambda *a, **k: submitted.append(1),
+            aggregator=agg,
         )
 
         assert active == {}
         assert ref_timeouts == {}
         assert len(pending) == 0
         assert submitted == []
+        assert agg.results == []
 
-# End-to-end integration tests against an in-memory fake backend.
 class _FakeRef:
     """Stand-in for ObjectRef."""
 
