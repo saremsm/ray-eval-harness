@@ -287,6 +287,8 @@ class DistributedEvalCoordinator:
         """returns True if batch should retry."""
         kind = classify_failure(exc)
         logger.error(f"Batch failed on worker {worker_idx} ({kind.name}): {exc}")
+        
+        self._check_and_replace_if_poisoned(workers, worker_idx)
 
         task_max_retries = (
             batch[0].max_retries
@@ -304,8 +306,6 @@ class DistributedEvalCoordinator:
                 f"(backoff: {backoff_seconds(retry_count):.1f}s)"
             )
             return True
-
-        self._check_and_replace_if_poisoned(workers, worker_idx)
 
         # Terminal failure: one EvalResult per task.
         self._record(aggregator, [

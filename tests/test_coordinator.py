@@ -583,3 +583,21 @@ class TestCoordinatorIntegration:
             f"retry exhaustion. Summary: {summary}"
         )
         assert summary["succeeded"] + summary["failed"] == 8
+
+    def test_poisoned_worker_replaced_on_first_failure(self, patched_ray):
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[
+                ["poison"],          # worker 0: poisons itself on first call
+                ["ok"] * 20,         # worker 1: always healthy
+            ],
+            n_tasks=8,
+            max_retries=2,
+        )
+        summary = coord.run(tasks)
+
+        assert summary["total"] == 8
+        assert summary["succeeded"] == 8, (
+            "After worker 0 poisons itself and is replaced, all retries "
+            f"should succeed against the fresh replacement. Got {summary}"
+        )
+        assert summary["failed"] == 0
