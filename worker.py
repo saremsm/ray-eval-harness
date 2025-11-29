@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -13,6 +14,8 @@ logger = logging.getLogger(__name__)
 MAX_NEW_TOKENS = 80
 
 HF_MICRO_BATCH_SIZE = 8
+# Per-batch wall-clock budget for one evaluate call (seconds). 
+DEFAULT_TASK_TIMEOUT = 60.0
 
 # HuggingFace pipeline backend
 @ray.remote
@@ -167,37 +170,39 @@ class HFWorker:
 # vLLM Backend
 @ray.remote(num_gpus=1)
 class VLLMWorker:
-    """vLLM worker: whole-GPU claim, synchronous LLM.generate."""
-
     def __init__(
         self,
         worker_id: int,
         model_name: str,
         max_new_tokens: int = MAX_NEW_TOKENS,
+        task_timeout: float = DEFAULT_TASK_TIMEOUT,
         tensor_parallel_size: int = 1,
     ) -> None:
         self.worker_id = worker_id
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
+        self.task_timeout = task_timeout
         self.tensor_parallel_size = tensor_parallel_size
         self.tasks_completed = 0
         self.tasks_failed = 0
         self._scorer = RubricScorer()
+        self._request_counter = 0
 
         logger.info(
             f"Worker {worker_id}: loading '{model_name}' "
-            f"(vLLM, tp={tensor_parallel_size})..."
+            f"(vLLM async, tp={tensor_parallel_size})..."
         )
 
-        from vllm import LLM, SamplingParams
+        from vllm import SamplingParams
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.engine.async_llm_engine import AsyncLLMEngine
 
-        self._llm = LLM(
+        engine_args = AsyncEngineArgs(
             model=model_name,
             dtype="auto",
             tensor_parallel_size=tensor_parallel_size,
         )
-        # Greedy decoding: outputs stable run-to-run. 
-        # Continuous batching doesn't guarantee bitwise determinism across batch.
+        self._engine = AsyncLLMEngine.from_engine_args(engine_args)
         self._sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
             temperature=0.0,
@@ -205,13 +210,39 @@ class VLLMWorker:
 
         logger.info(f"Worker {worker_id}: ready")
 
-    def evaluate_batch(self, tasks: list[EvalTask]) -> list[EvalResult]:
-        prompts = [task.prompt for task in tasks]
+    def _next_request_id(self) -> str:
+        self._request_counter += 1
+        return f"w{self.worker_id}-r{self._request_counter}"
 
+    async def evaluate_batch(self, tasks: list[EvalTask]) -> list[EvalResult]:
+        """submit all prompts concurrently, gather terminal outputs."""
         start = time.perf_counter()
+        request_ids: list[str] = []
+
+        async def _run_one(task: EvalTask) -> tuple[str, list[int]]:
+            request_id = self._next_request_id()
+            request_ids.append(request_id)
+            final_output = None
+            stream = self._engine.generate(
+                task.prompt, self._sampling_params, request_id
+            )
+            async for output in stream:
+                final_output = output
+            assert final_output is not None, "engine produced no output"
+            completion = final_output.outputs[0]
+            return completion.text, list(completion.token_ids)
+
         try:
-            outputs = self._llm.generate(prompts, self._sampling_params)
+            outputs = await asyncio.wait_for(
+                asyncio.gather(*[_run_one(t) for t in tasks]),
+                timeout=self.task_timeout,
+            )
         except Exception:
+            for rid in request_ids:
+                try:
+                    await self._engine.abort(rid)
+                except Exception:
+                    pass
             self.tasks_failed += len(tasks)
             raise
 
@@ -219,9 +250,7 @@ class VLLMWorker:
         estimated_per_task = batch_latency / len(tasks)
 
         results = []
-        for task, output in zip(tasks, outputs):
-            completion = output.outputs[0]
-            response = completion.text
+        for task, (response, token_ids) in zip(tasks, outputs):
             score, condition_scores = self._scorer.score(response, task)
             self.tasks_completed += 1
             results.append(EvalResult(
@@ -231,25 +260,69 @@ class VLLMWorker:
                 latency_seconds=estimated_per_task,
                 worker_id=self.worker_id,
                 condition_scores=condition_scores,
-                tokens_generated=len(completion.token_ids),
+                tokens_generated=len(token_ids),
             ))
         return results
-    
-    def evaluate_with_hooks(
+
+    async def evaluate_with_hooks(
         self,
         task: EvalTask,
         hooks: list,  # list[InterventionHook]
     ) -> EvalResult:
-        """not supported: synchronous LLM.generate returns only terminal outputs."""
-        raise NotImplementedError(
-            "vLLM backend does not support hooks: synchronous generate has "
-            "no per-token hook point"
+        request_id = self._next_request_id()
+        start = time.perf_counter()
+        stopped_early = False
+        accumulated = ""
+        token_count = 0
+
+        try:
+            stream = self._engine.generate(
+                task.prompt, self._sampling_params, request_id
+            )
+            async for output in stream:
+                completion = output.outputs[0]
+                new_text = completion.text[len(accumulated):]
+                token_count = len(completion.token_ids)
+
+                if new_text:
+                    for hook in hooks:
+                        hook.on_delta(new_text, completion.text)
+
+                accumulated = completion.text
+
+                if any(hook.should_stop(accumulated) for hook in hooks):
+                    stopped_early = True
+                    await self._engine.abort(request_id)
+                    break
+
+        except Exception:
+            self.tasks_failed += 1
+            try:
+                await self._engine.abort(request_id)
+            except Exception:
+                pass
+            raise
+
+        elapsed = time.perf_counter() - start
+        score, condition_scores = self._scorer.score(accumulated, task)
+        self.tasks_completed += 1
+
+        return EvalResult(
+            task_id=task.task_id,
+            score=score,
+            response=accumulated,
+            latency_seconds=elapsed,
+            hooked=True,
+            worker_id=self.worker_id,
+            condition_scores=condition_scores,
+            tokens_generated=token_count,
+            stopped_early=stopped_early,
         )
-        
-    def health_check(self) -> bool:
+
+    async def health_check(self) -> bool:
         return True
 
-    def get_stats(self) -> dict:
+    async def get_stats(self) -> dict:
         return {
             "worker_id": self.worker_id,
             "model": self.model_name,
