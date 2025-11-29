@@ -17,23 +17,92 @@ HF_MICRO_BATCH_SIZE = 8
 # Per-batch wall-clock budget for one evaluate call (seconds). 
 DEFAULT_TASK_TIMEOUT = 60.0
 
+def _make_timeout_criterion(deadline: float):
+    """StoppingCriteria that fires once monotonic time passes deadline."""
+    from transformers import StoppingCriteria
+
+    class _TimeoutCriterion(StoppingCriteria):
+        def __init__(self):
+            """device: -1 CPU, 0+ CUDA."""
+            super().__init__()
+            self.deadline = deadline
+            self.timed_out = False
+
+        def __call__(self, input_ids, scores, **kwargs):
+            if time.monotonic() >= self.deadline:
+                self.timed_out = True
+                return True
+            return False
+
+    return _TimeoutCriterion()
+
+
+def _make_hook_criterion(hooks, tokenizer):
+    """StoppingCriteria that runs hook callbacks after each step and halts when any
+    hook signals stop."""
+    from transformers import StoppingCriteria
+
+    class _HookCriterion(StoppingCriteria):
+        def __init__(self):
+            super().__init__()
+            self.hooks = hooks
+            self.tokenizer = tokenizer
+            # Set on first call: input_ids is prompt + 1 generated token.
+            self.prompt_length = None
+            self.accumulated = ""
+            self.stopped_early = False
+            self.token_count = 0
+
+        def __call__(self, input_ids, scores, **kwargs):
+            if self.prompt_length is None:
+                self.prompt_length = input_ids.shape[1] - 1
+
+            generated_ids = input_ids[0, self.prompt_length:]
+            if generated_ids.numel() == 0:
+                return False
+
+            full_text = self.tokenizer.decode(
+                generated_ids, skip_special_tokens=True
+            )
+            delta = full_text[len(self.accumulated):]
+            if not delta:
+                return False
+
+            self.accumulated = full_text
+            self.token_count = int(generated_ids.numel())
+
+            for hook in self.hooks:
+                hook.on_delta(delta, self.accumulated)
+
+            if any(hook.should_stop(self.accumulated) for hook in self.hooks):
+                self.stopped_early = True
+                return True
+            return False
+
+    return _HookCriterion()
+
 # HuggingFace pipeline backend
 @ray.remote
 class HFWorker:
     """persistent worker: model loads once in __init__, reused across batches."""
-    def __init__(self, worker_id: int, model_name: str = "distilgpt2",
-        device: int = -1,) -> None:
-        """device: -1 CPU, 0+ CUDA. GPU accounting is the coordinator's:
-        _worker_factory claims fractional num_gpus (device >= 0) so Ray doesn't
-        stack unaccounted replicas."""
+    def __init__(
+        self, 
+        worker_id: int, 
+        model_name: str = "distilgpt2",
+        task_timeout: float = DEFAULT_TASK_TIMEOUT,
+        device: int = -1,
+    ) -> None:
+        """device: -1 for CPU, 0+ for CUDA devices."""
         self.worker_id = worker_id
         self.model_name = model_name
+        self.task_timeout = task_timeout
         self.device = device
         self.tasks_completed = 0
         self.tasks_failed = 0
         self._scorer = RubricScorer()
         # Retained for truly unrecoverable states / future circuit breaking.
         self._poisoned = False
+        
 
         logger.info(
             f"Worker {worker_id}: loading '{model_name}' (HF, device={device})..."
@@ -57,21 +126,33 @@ class HFWorker:
                 "Coordinator must replace worker."
             )
         
+        from transformers import StoppingCriteriaList
+
         prompts = [task.prompt for task in tasks]
-        
+        deadline = time.monotonic() + self.task_timeout
+        timeout_criterion = _make_timeout_criterion(deadline)
+
         start = time.perf_counter()
         try:
             raw_outputs = self._pipeline(prompts, max_new_tokens=MAX_NEW_TOKENS,
                 pad_token_id=self._pipeline.tokenizer.eos_token_id,
                 batch_size=min(len(prompts), HF_MICRO_BATCH_SIZE),
                 return_full_text=False,
+                stopping_criteria=StoppingCriteriaList([timeout_criterion]),
             )
         except Exception:
             self.tasks_failed += len(tasks)
             raise
 
         batch_latency = time.perf_counter() - start
-
+        
+        if timeout_criterion.timed_out:
+            self.tasks_failed += len(tasks)
+            raise TimeoutError(
+                f"Worker {self.worker_id}: batch of {len(tasks)} exceeded "
+                f"{self.task_timeout}s; partial outputs discarded"
+            )
+        
         estimated_per_task = batch_latency / len(tasks)
         results = []
         for task, output in zip(tasks, raw_outputs):
@@ -94,51 +175,35 @@ class HFWorker:
         task: EvalTask,
         hooks: list,  # list[InterventionHook]
     ) -> EvalResult:
-        """per-token hooks via TextIteratorStreamer; generation runs in a background thread."""
+        """per-token hooks via TextIteratorStreamer; generation runs in a background
+        thread."""
         if self._poisoned:
             raise RuntimeError(f"Worker {self.worker_id} poisoned, replace me")
 
-        from threading import Thread
-        from transformers import TextIteratorStreamer
+        from transformers import StoppingCriteriaList
 
-        tokenizer = self._pipeline.tokenizer
-        model = self._pipeline.model
-        inputs = tokenizer(task.prompt, return_tensors="pt").to(model.device)
-        streamer = TextIteratorStreamer(
-            tokenizer, skip_prompt=True, skip_special_tokens=True
-        )
-
-        thread = Thread(
-            target=model.generate,
-            kwargs=dict(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                pad_token_id=tokenizer.eos_token_id,
-                streamer=streamer,
-            ),
-            daemon=True,
+        criterion = _make_hook_criterion(
+            hooks=hooks,
+            tokenizer=self._pipeline.tokenizer,
         )
 
         start = time.perf_counter()
-        thread.start()
-
-        accumulated = ""
-        stopped_early = False
-        token_count = 0
-        for delta in streamer:
-            if not delta:
-                continue
-            accumulated += delta
-            token_count += 1
-            for hook in hooks:
-                hook.on_delta(delta, accumulated)
-            if any(hook.should_stop(accumulated) for hook in hooks):
-                stopped_early = True
-                break
+        try:
+            outputs = self._pipeline(
+                task.prompt,
+                max_new_tokens=MAX_NEW_TOKENS,
+                pad_token_id=self._pipeline.tokenizer.eos_token_id,
+                stopping_criteria=StoppingCriteriaList([criterion]),
+                return_full_text=False,
+            )
+        except Exception:
+            self.tasks_failed += 1
+            raise
 
         elapsed = time.perf_counter() - start
-        response = accumulated
+        response = outputs[0]["generated_text"]
         score, condition_scores = self._scorer.score(response, task)
+
         self.tasks_completed += 1
 
         return EvalResult(
@@ -149,8 +214,8 @@ class HFWorker:
             hooked=True,
             worker_id=self.worker_id,
             condition_scores=condition_scores,
-            tokens_generated=token_count,
-            stopped_early=stopped_early,
+            tokens_generated=criterion.token_count,
+            stopped_early=criterion.stopped_early,
         )
 
     def health_check(self) -> bool:

@@ -87,6 +87,12 @@ class TestClassifyFailure:
         assert classify_failure(
             IndexError("index out of range")
         ) == FailureKind.DETERMINISTIC
+    
+    def test_worker_batch_timeout_is_transient(self):
+        """The worker's per-batch TimeoutError (no longer a poisoning RuntimeError)"""
+        assert classify_failure(
+            TimeoutError("Worker 3: batch of 4 exceeded 60.0s")
+        ) == FailureKind.TRANSIENT
 
 class TestAssignNext:
     def test_submits_with_correct_retry_count(self):

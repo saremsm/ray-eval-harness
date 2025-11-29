@@ -55,6 +55,7 @@ class DistributedEvalCoordinator:
         model_name: str = "distilgpt2",
         backend: str = "hf",
         max_retries: int = 2,
+        task_timeout: float = 60.0,
         output_path: str = "results/results.jsonl",
         batch_size: int = 4,
         aggregator_cls=ResultsAggregator,
@@ -63,6 +64,8 @@ class DistributedEvalCoordinator:
         self.model_name = model_name
         self.backend = backend
         self.max_retries = max_retries
+        # task_timeout is per-BATCH.
+        self.task_timeout = task_timeout
         self.output_path = output_path
         self.batch_size = batch_size
 
@@ -355,6 +358,7 @@ class DistributedEvalCoordinator:
             self._worker_cls.remote(
                 worker_id=i,
                 model_name=self.model_name,
+                task_timeout=self.task_timeout,
             )
             for i in range(self.n_workers)
         ]
@@ -384,6 +388,7 @@ class DistributedEvalCoordinator:
                 new_worker = self._worker_cls.remote(
                     worker_id=failed_idx,
                     model_name=self.model_name,
+                    task_timeout=self.task_timeout,
                 )
                 ray.get(new_worker.health_check.remote(), timeout=120.0)
                 validate_backend(new_worker)

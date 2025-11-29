@@ -216,11 +216,22 @@ def main() -> None:
         help="HuggingFace model name (default: distilgpt2)",
     )
     parser.add_argument(
-        "--backend", type=str, default="hf",
-        choices=["hf", "vllm"],
-        help="Inference backend: hf (transformers pipeline, CPU-friendly) "
-        "or vllm (GPU engine with continuous batching). "
-        "Default: hf",
+        "--backend", type=str, default="hf", choices=["hf", "vllm"],
+        help=(
+            "Inference backend: 'hf' (CPU or single GPU) or 'vllm' "
+            "(GPU required, default: hf)"
+        ),
+    )
+    parser.add_argument(
+        "--task-timeout", type=float, default=60.0, dest="task_timeout",
+        help=(
+            "Per-BATCH timeout in seconds, enforced inside the worker "
+            "(StoppingCriteria on HF, asyncio.wait_for on vLLM). It "
+            "bounds the whole batch, not each task; size it for "
+            "batch_size * worst-case task time. A timeout raises and the "
+            "batch is retried; the worker is replaced only if a health "
+            "check fails (default: 60.0)"
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true", dest="dry_run",
@@ -256,6 +267,7 @@ def main() -> None:
         n_workers=args.workers,
         model_name=args.model,
         backend=args.backend,
+        task_timeout=args.task_timeout,
         output_path=args.output,
     )
 
