@@ -56,6 +56,8 @@ class DistributedEvalCoordinator:
         backend: str = "hf",
         max_retries: int = 2,
         task_timeout: float = 60.0,
+        failure_rate: float = 0.0,
+        seed: int = 0,
         output_path: str = "results/results.jsonl",
         batch_size: int = 4,
         aggregator_cls=ResultsAggregator,
@@ -66,6 +68,8 @@ class DistributedEvalCoordinator:
         self.max_retries = max_retries
         # task_timeout is per-BATCH.
         self.task_timeout = task_timeout
+        self.failure_rate = failure_rate
+        self.seed = seed
         self.output_path = output_path
         self.batch_size = batch_size
 
@@ -82,7 +86,8 @@ class DistributedEvalCoordinator:
         pending[] when time hits. main loop keeps draining"""
         workers = self._create_workers()
         aggregator = self._aggregator_cls.remote( 
-            total_tasks=len(tasks), output_path=self.output_path,
+            total_tasks=len(tasks), 
+            output_path=self.output_path,
         )
         # Ready to dispatch.
         pending: deque[tuple[list[EvalTask], int]] = deque(
@@ -271,7 +276,11 @@ class DistributedEvalCoordinator:
                 submit(worker_idx, batch_to_send, rc)
 
     # Helpers
-    def _record(self, aggregator: object, results: list[EvalResult]) -> None:
+    def _record(
+        self, 
+        aggregator: object, 
+        results: list[EvalResult]
+    ) -> None:
         for result in results:
             ray.get(aggregator.add_result.remote(result))
     
@@ -327,7 +336,10 @@ class DistributedEvalCoordinator:
         return False
 
     def _check_and_replace_if_poisoned(
-        self, workers: list, worker_idx: int,) -> None:
+        self, 
+        workers: list, 
+        worker_idx: int,
+    ) -> None:
         """health-check the worker; replace if poisoned or unresponsive."""
         if workers[worker_idx] is None:
             return
@@ -342,7 +354,12 @@ class DistributedEvalCoordinator:
         if not is_healthy:
             self._replace_worker(workers, worker_idx)
 
-    def _assign_next(self, worker_idx: int, pending: deque, submit,) -> None:
+    def _assign_next(
+        self, 
+        worker_idx: int, 
+        pending: deque, 
+        submit,
+    ) -> None:
         """Give freed worker its next batch, if any."""
         if pending:
             batch, retry_count = pending.popleft()
@@ -359,6 +376,8 @@ class DistributedEvalCoordinator:
                 worker_id=i,
                 model_name=self.model_name,
                 task_timeout=self.task_timeout,
+                failure_rate=self.failure_rate,
+                seed=self.seed,
             )
             for i in range(self.n_workers)
         ]
@@ -389,6 +408,8 @@ class DistributedEvalCoordinator:
                     worker_id=failed_idx,
                     model_name=self.model_name,
                     task_timeout=self.task_timeout,
+                    failure_rate=self.failure_rate,
+                    seed=self.seed,
                 )
                 ray.get(new_worker.health_check.remote(), timeout=120.0)
                 validate_backend(new_worker)

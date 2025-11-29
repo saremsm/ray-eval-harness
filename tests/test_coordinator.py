@@ -1,6 +1,5 @@
 import time
 import pytest
-from types import SimpleNamespace
 from unittest.mock import patch
 from collections import deque
 
@@ -41,11 +40,16 @@ class _FakeWorker:
 
 class _CapturingAggregator:
     """records add_result payloads."""
+    class _Method:
+        def __init__(self, fn):
+            self.fn = fn
+
+        def remote(self, *args, **kwargs):
+            return self.fn(*args, **kwargs)
+
     def __init__(self):
         self.results = []
-        self.add_result = SimpleNamespace(
-            remote=lambda r: (self.results.append(r), r)[1]
-        )
+        self.add_result = self._Method(self.results.append)
 
 # Validate Backend
 class TestValidateBackend:
@@ -223,6 +227,67 @@ class TestHandleTimeouts:
         )
         assert agg.results == []
 
+    def test_ages_independent_across_refs(self):
+        """One old ref must not cause young refs to be evicted in the same call."""
+        coord = self._make_coord()
+        ref_old = _Ref("old")
+        ref_young = _Ref("young")
+        batch_old = [make_task("t_old")]
+        batch_young = [make_task("t_young")]
+        workers = [_FakeWorker(), _FakeWorker()]
+
+        now = time.monotonic()
+        active = {
+            ref_old: (0, batch_old, 0),
+            ref_young: (1, batch_young, 0),
+        }
+        ref_timeouts = {
+            ref_old: now - HUNG_REF_THRESHOLD_S - 1.0,
+            ref_young: now,
+        }
+
+        agg = _CapturingAggregator()
+        coord._handle_timeouts(
+            active=active,
+            ref_timeouts=ref_timeouts,
+            workers=workers,
+            pending=deque(),
+            submit=lambda *a, **k: None,
+            aggregator=agg,
+        )
+
+        assert ref_old not in active
+        assert ref_old not in ref_timeouts
+        assert ref_young in active, (
+            "Young ref must remain active despite ref_old's eviction in the "
+            "same call. Eviction decisions must be per-ref, not global."
+        )
+        assert ref_young in ref_timeouts
+        assert agg.results == []
+
+    def test_no_eviction_when_no_refs_outstanding(self):
+        coord = self._make_coord()
+        active: dict = {}
+        ref_timeouts: dict = {}
+        pending: deque = deque()
+        submitted = []
+
+        agg = _CapturingAggregator()
+        coord._handle_timeouts(
+            active=active,
+            ref_timeouts=ref_timeouts,
+            workers=[_FakeWorker()],
+            pending=pending,
+            submit=lambda *a, **k: submitted.append(1),
+            aggregator=agg,
+        )
+
+        assert active == {}
+        assert ref_timeouts == {}
+        assert len(pending) == 0
+        assert submitted == []
+        assert agg.results == []
+
     def test_hang_budget_exhaustion_records_terminal_failures(self):
         """Hang past max_retries => recorded terminal failure, not re-queued.
         Regression: retry_count incremented on the hang path but never checked;
@@ -257,68 +322,26 @@ class TestHandleTimeouts:
         )
         assert all(r.failed for r in agg.results)
         assert all("retry budget exhausted" in r.error for r in agg.results)
-
-
-    def test_ages_independent_across_refs(self):
-        """One old ref must not cause young refs to be evicted in the same call."""
-        coord = self._make_coord()
-        agg = _CapturingAggregator()
-        ref_old = _Ref("old")
-        ref_young = _Ref("young")
-        batch_old = [make_task("t_old")]
-        batch_young = [make_task("t_young")]
-        workers = [_FakeWorker(), _FakeWorker()]
-
-        now = time.monotonic()
-        active = {
-            ref_old: (0, batch_old, 0),
-            ref_young: (1, batch_young, 0),
-        }
-        ref_timeouts = {
-            ref_old: now - HUNG_REF_THRESHOLD_S - 1.0,
-            ref_young: now,
-        }
-
-        coord._handle_timeouts(
-            active=active,
-            ref_timeouts=ref_timeouts,
-            workers=workers,
-            pending=deque(),
-            submit=lambda *a, **k: None,
-            aggregator=agg,
+    
+    def test_poisoned_worker_replaced_on_first_failure(self, patched_ray):
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[
+                ["poison"],          # worker 0: poisons itself on first call
+                ["ok"] * 20,         # worker 1: always healthy
+            ],
+            n_tasks=8,
+            max_retries=2,
         )
+        summary = coord.run(tasks)
 
-        assert ref_old not in active
-        assert ref_old not in ref_timeouts
-        assert ref_young in active, (
-            "Young ref must remain active despite ref_old's eviction in the "
-            "same call. Eviction decisions must be per-ref, not global."
+        assert summary["total"] == 8
+        assert summary["succeeded"] == 8, (
+            "After worker 0 poisons itself and is replaced, all retries "
+            f"should succeed against the fresh replacement. Got {summary}"
         )
-        assert ref_young in ref_timeouts
+        assert summary["failed"] == 0
 
-    def test_no_eviction_when_no_refs_outstanding(self):
-        coord = self._make_coord()
-        active: dict = {}
-        ref_timeouts: dict = {}
-        pending: deque = deque()
-        submitted = []
-
-        agg = _CapturingAggregator()
-        coord._handle_timeouts(
-            active=active,
-            ref_timeouts=ref_timeouts,
-            workers=[_FakeWorker()],
-            pending=pending,
-            submit=lambda *a, **k: submitted.append(1),
-            aggregator=agg,
-        )
-
-        assert active == {}
-        assert ref_timeouts == {}
-        assert len(pending) == 0
-        assert submitted == []
-        assert agg.results == []
-
+# End-to-end integration tests against an in-memory fake backend.
 class _FakeRef:
     """Stand-in for ObjectRef."""
 
@@ -551,7 +574,6 @@ class TestCoordinatorIntegration:
         assert summary["succeeded"] == 8
         assert summary["failed"] == 0
 
-
     def test_transient_failure_is_retried_and_succeeds(self, patched_ray):
         # Worker 0 fails on first call, then succeeds. Worker 1 is always healthy.
         coord, tasks = _coordinator_with_fake_workers(
@@ -589,21 +611,3 @@ class TestCoordinatorIntegration:
             f"retry exhaustion. Summary: {summary}"
         )
         assert summary["succeeded"] + summary["failed"] == 8
-
-    def test_poisoned_worker_replaced_on_first_failure(self, patched_ray):
-        coord, tasks = _coordinator_with_fake_workers(
-            plan_per_worker=[
-                ["poison"],          # worker 0: poisons itself on first call
-                ["ok"] * 20,         # worker 1: always healthy
-            ],
-            n_tasks=8,
-            max_retries=2,
-        )
-        summary = coord.run(tasks)
-
-        assert summary["total"] == 8
-        assert summary["succeeded"] == 8, (
-            "After worker 0 poisons itself and is replaced, all retries "
-            f"should succeed against the fresh replacement. Got {summary}"
-        )
-        assert summary["failed"] == 0

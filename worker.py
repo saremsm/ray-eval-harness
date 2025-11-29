@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 
 import ray
@@ -17,6 +18,7 @@ HF_MICRO_BATCH_SIZE = 8
 # Per-batch wall-clock budget for one evaluate call (seconds). 
 DEFAULT_TASK_TIMEOUT = 60.0
 
+# Stopping Criteria Helpers (HF Backend)
 def _make_timeout_criterion(deadline: float):
     """StoppingCriteria that fires once monotonic time passes deadline."""
     from transformers import StoppingCriteria
@@ -91,12 +93,16 @@ class HFWorker:
         model_name: str = "distilgpt2",
         task_timeout: float = DEFAULT_TASK_TIMEOUT,
         device: int = -1,
+        failure_rate: float = 0.0,
+        seed: int = 0,
     ) -> None:
         """device: -1 for CPU, 0+ for CUDA devices."""
         self.worker_id = worker_id
         self.model_name = model_name
         self.task_timeout = task_timeout
         self.device = device
+        self._failure_rate = failure_rate
+        self._rng = random.Random(seed + worker_id)
         self.tasks_completed = 0
         self.tasks_failed = 0
         self._scorer = RubricScorer()
@@ -110,7 +116,9 @@ class HFWorker:
 
         from transformers import pipeline as hf_pipeline
         self._pipeline = hf_pipeline(
-            "text-generation", model=model_name, device=device,
+            "text-generation", 
+            model=model_name, 
+            device=device,
         )
         self._pipeline.tokenizer.pad_token_id = (
             self._pipeline.model.config.eos_token_id
@@ -125,6 +133,10 @@ class HFWorker:
                 f"Worker {self.worker_id} is poisoned. "
                 "Coordinator must replace worker."
             )
+	
+        if self._failure_rate > 0 and self._rng.random() < self._failure_rate:
+            self.tasks_failed += len(tasks)
+            raise RuntimeError(f"injected failure (worker {self.worker_id})")
         
         from transformers import StoppingCriteriaList
 
@@ -134,7 +146,9 @@ class HFWorker:
 
         start = time.perf_counter()
         try:
-            raw_outputs = self._pipeline(prompts, max_new_tokens=MAX_NEW_TOKENS,
+            raw_outputs = self._pipeline(
+                prompts, 
+                max_new_tokens=MAX_NEW_TOKENS,
                 pad_token_id=self._pipeline.tokenizer.eos_token_id,
                 batch_size=min(len(prompts), HF_MICRO_BATCH_SIZE),
                 return_full_text=False,
@@ -241,12 +255,16 @@ class VLLMWorker:
         model_name: str,
         max_new_tokens: int = MAX_NEW_TOKENS,
         task_timeout: float = DEFAULT_TASK_TIMEOUT,
+        failure_rate: float = 0.0,
+        seed: int = 0,
         tensor_parallel_size: int = 1,
     ) -> None:
         self.worker_id = worker_id
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
         self.task_timeout = task_timeout
+        self._failure_rate = failure_rate
+        self._rng = random.Random(seed + worker_id)
         self.tensor_parallel_size = tensor_parallel_size
         self.tasks_completed = 0
         self.tasks_failed = 0
@@ -281,6 +299,10 @@ class VLLMWorker:
 
     async def evaluate_batch(self, tasks: list[EvalTask]) -> list[EvalResult]:
         """submit all prompts concurrently, gather terminal outputs."""
+        if self._failure_rate > 0 and self._rng.random() < self._failure_rate:
+            self.tasks_failed += len(tasks)
+            raise RuntimeError(f"injected failure (worker {self.worker_id})")
+        
         start = time.perf_counter()
         request_ids: list[str] = []
 
@@ -315,6 +337,8 @@ class VLLMWorker:
         estimated_per_task = batch_latency / len(tasks)
 
         results = []
+        failure_rate: float = 0.0,
+        seed: int = 0,
         for task, (response, token_ids) in zip(tasks, outputs):
             score, condition_scores = self._scorer.score(response, task)
             self.tasks_completed += 1

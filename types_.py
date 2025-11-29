@@ -67,7 +67,9 @@ class EvalResult:
             "tokens_generated": self.tokens_generated,
             "stopped_early": self.stopped_early,
         }
-    
+
+# EvalBackend Protocol
+@runtime_checkable    
 class InterventionHook(Protocol):
     """Per-step callback for generation."""
 
@@ -79,7 +81,6 @@ class InterventionHook(Protocol):
         """Return True to halt. Sets stopped_early=True on result."""
         ...
 
-# EvalBackend Protocol
 @runtime_checkable
 class EvalBackend(Protocol):
     """Structural interface for eval backends. @runtime_checkable doesn't help."""

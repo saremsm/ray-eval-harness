@@ -8,12 +8,15 @@ import time
 import ray
 
 from coordinator import DistributedEvalCoordinator
-from types_ import EvalTask, ScoringCondition
 from hooks import EarlyStoppingHook, LoggingHook
+from types_ import EvalTask, ScoringCondition
 from worker import HFWorker
 
-logging.basicConfig(level=logging.INFO, 
-    format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S",)
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s %(levelname)s %(message)s", 
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 # Task Templates
@@ -76,8 +79,11 @@ def make_tasks(n: int) -> list[EvalTask]:
             else f"task_{i:05d}_c{cycle}"
         )
         tasks.append(
-            EvalTask(task_id=task_id, prompt=prompt,
-                expected_answer=answer, conditions=list(_CONDITIONS),
+            EvalTask(
+                task_id=task_id, 
+                prompt=prompt,
+                expected_answer=answer, 
+                conditions=list(_CONDITIONS),
                 metadata={"prompt": prompt, "expected": answer, "cycle": cycle},
             )
         )
@@ -156,47 +162,6 @@ def print_summary(summary: dict, wall_elapsed: float) -> None:
                 f"{'yes' if ws['poisoned'] else 'no':>10}"
             )
     print(f"{'=' * width}\n")
-    
-def run_hooked_demo(model_name: str) -> None:
-    """Single-task hook demo."""
-    print("\n" + "=" * 62)
-    print("  Mid-generation intervention demo (hooked evaluation)")
-    print("=" * 62)
-
-    worker = HFWorker.remote(
-        worker_id=99,
-        model_name=model_name,
-    )
-    ray.get(worker.health_check.remote())
-
-    task = EvalTask(
-        task_id="hook_demo",
-        prompt="The capital of France is",
-        expected_answer="Paris",
-        conditions=list(_CONDITIONS),
-    )
-
-    stop_hook = EarlyStoppingHook(triggers=["Paris", "paris"])
-    # INFO level so the per-token lines are visible under the default logging
-    log_hook = LoggingHook(
-        task_id=task.task_id, log_every_n=1, level=logging.INFO
-    )
-
-    print(f"  Prompt:          '{task.prompt}'")
-    print(f"  Expected answer: '{task.expected_answer}'")
-    print(f"  Hook:            stop as soon as 'Paris' appears\n")
-
-    result = ray.get(
-        worker.evaluate_with_hooks.remote(task, [stop_hook, log_hook])
-    )
-
-    print(f"  Response:        {result.response!r}")
-    print(f"  Score:           {result.score:.3f}")
-    print(f"  Tokens generated:{result.tokens_generated}")
-    print(f"  Stopped early:   {result.stopped_early}")
-    if stop_hook.triggered_by:
-        print(f"  Triggered by:    {stop_hook.triggered_by!r}")
-    print("=" * 62 + "\n")
 
 # Entry Point
 def main() -> None:
@@ -210,6 +175,14 @@ def main() -> None:
     parser.add_argument(
         "--workers", type=int, default=3,
         help="Number of parallel Evalworker actors (default: 3)",
+    )
+    parser.add_argument(
+        "--failure-rate", type=float, default=0.0, dest="failure_rate",
+        help="Fraction of batches to fail artificially.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="Seed for fault injection RNG.",
     )
     parser.add_argument(
         "--model", type=str, default="distilgpt2",
@@ -268,20 +241,66 @@ def main() -> None:
         model_name=args.model,
         backend=args.backend,
         task_timeout=args.task_timeout,
+        failure_rate=args.failure_rate,
+        seed=args.seed,
         output_path=args.output,
     )
 
     logger.info(
         f"Starting: tasks={args.tasks}, workers={args.workers}, "
         f"backend={args.backend}, model={args.model}"
+        f"failure_rate={args.failure_rate}, seed={args.seed}"
     )
 
     wall_start = time.perf_counter()
     summary = coordinator.run(tasks)
     wall_elapsed = time.perf_counter() - wall_start
+
     print_summary(summary, wall_elapsed)
+
     if args.hook: run_hooked_demo(args.model)
     ray.shutdown()
+
+def run_hooked_demo(model_name: str) -> None:
+    """Single-task hook demo."""
+    print("\n" + "=" * 62)
+    print("  Mid-generation intervention demo (hooked evaluation)")
+    print("=" * 62)
+
+    worker = HFWorker.remote(
+        worker_id=99,
+        model_name=model_name,
+    )
+    ray.get(worker.health_check.remote())
+
+    task = EvalTask(
+        task_id="hook_demo",
+        prompt="The capital of France is",
+        expected_answer="Paris",
+        conditions=list(_CONDITIONS),
+    )
+
+    stop_hook = EarlyStoppingHook(triggers=["Paris", "paris"])
+    # INFO level so the per-token lines are visible under the default logging
+    log_hook = LoggingHook(
+        task_id=task.task_id, log_every_n=1, level=logging.INFO
+    )
+
+    print(f"  Prompt:          '{task.prompt}'")
+    print(f"  Expected answer: '{task.expected_answer}'")
+    print(f"  Hook:            stop as soon as 'Paris' appears\n")
+
+    result = ray.get(
+        worker.evaluate_with_hooks.remote(task, [stop_hook, log_hook])
+    )
+
+    print(f"  Response:        {result.response!r}")
+    print(f"  Score:           {result.score:.3f}")
+    print(f"  Tokens generated:{result.tokens_generated}")
+    print(f"  Stopped early:   {result.stopped_early}")
+    if stop_hook.triggered_by:
+        print(f"  Triggered by:    {stop_hook.triggered_by!r}")
+    print("=" * 62 + "\n")
     
 if __name__ == "__main__":
     main()

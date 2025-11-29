@@ -13,7 +13,8 @@ Ray-based eval harness for LLMs. Schedules batches of completion tasks across a 
               +---------------------+--------------------+
               |                     |                    |
         +-----v-----+         +-----v-----+        +-----v-----+
-        |HFWorker   |         |VLLMWorker |        |HFWorker   |
+        | HFWorker  |         |VLLMWorker |        | HFWorker  |
+        |  (actor)  |         |  (actor)  |        |  (actor)  |
         +-----+-----+         +-----+-----+        +-----+-----+
               |                     |                    |
               +---------------------+--------------------+

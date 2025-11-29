@@ -23,15 +23,16 @@ def _percentile(sorted_values: list[float], q: float) -> float:
 class ResultsAggregator:
     """Collects EvalResults, computes runstats, writes JSONL."""
     def __init__(
-            self, total_tasks: int,
-            output_path: str = "results/results.jsonl",
+        self, 
+        total_tasks: int,
+        output_path: str = "results/results.jsonl",
     ) -> None:
         self.total_tasks = total_tasks
         self.output_path = Path(output_path)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.start_time = time.perf_counter()
 
-        self.count = 0
+        self._count = 0
         self._succeeded = 0
         self._failed = 0
         self._score_sum = 0.0
@@ -72,7 +73,7 @@ class ResultsAggregator:
         status = "OK  " if result.succeeded else "FAIL"
         logger.info(
             f"[{self._count:4d}/{self.total_tasks}] {status} "
-            f"tasks={result.task_id} score={result.score:.3f} "
+            f"task={result.task_id} score={result.score:.3f} "
             f"latency={result.latency_seconds:.2f}s "
             f"worker={result.worker_id} rate={rate:.1f}/s"
         )
