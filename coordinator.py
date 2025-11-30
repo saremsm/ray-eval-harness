@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections import deque
 
@@ -47,6 +48,20 @@ def backoff_seconds(retry_count: int) -> float:
     """exponential backoff, capped at 8s."""
     return min(8.0, 0.5 * (2 ** retry_count))
 
+@ray.remote
+class FailureDecider:
+    """Shared, deterministic fault-injection oracle."""
+    def __init__(self, seed: int = 0) -> None:
+        self._seed = seed
+        self._attempts: dict[tuple, int] = {}
+    def should_fail(self, batch_key: tuple, failure_rate: float) -> bool:
+        attempt = self._attempts.get(batch_key, 0)
+        self._attempts[batch_key] = attempt + 1
+        # failure_rate goes into the seed so different rates produce different
+        seed = hash((self._seed, batch_key, attempt, failure_rate))
+        rng = random.Random(seed)
+        return rng.random() < failure_rate
+
 class DistributedEvalCoordinator:
     """Work-Stealing coordinator across a pool of EvalWorker actors. aggregator_cls."""
     def __init__(
@@ -70,6 +85,7 @@ class DistributedEvalCoordinator:
         self.task_timeout = task_timeout
         self.failure_rate = failure_rate
         self.seed = seed
+        self._failure_decider = None
         self.output_path = output_path
         self.batch_size = batch_size
 
@@ -371,13 +387,17 @@ class DistributedEvalCoordinator:
             f"(backend={self.backend}, model={self.model_name}, "
             f"batch_size={self.batch_size})..."
         )
+        self._failure_decider = (
+            FailureDecider.remote(seed=self.seed)
+            if self.failure_rate > 0 else None
+        )
         workers = [
             self._worker_cls.remote(
                 worker_id=i,
                 model_name=self.model_name,
                 task_timeout=self.task_timeout,
                 failure_rate=self.failure_rate,
-                seed=self.seed,
+                decider=self._failure_decider,
             )
             for i in range(self.n_workers)
         ]
@@ -409,7 +429,7 @@ class DistributedEvalCoordinator:
                     model_name=self.model_name,
                     task_timeout=self.task_timeout,
                     failure_rate=self.failure_rate,
-                    seed=self.seed,
+                    decider=self._failure_decider,
                 )
                 ray.get(new_worker.health_check.remote(), timeout=120.0)
                 validate_backend(new_worker)
