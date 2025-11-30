@@ -1,6 +1,6 @@
 import pytest
 
-from coordinator import FailureDeciderImpl, _stable_seed
+from fault_injection import FailureDeciderImpl, _stable_seed
 
 
 class TestStableSeed:

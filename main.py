@@ -90,6 +90,24 @@ def make_tasks(n: int) -> list[EvalTask]:
     return tasks
 
 # Summary
+def _build_fault_injection(backend: str, failure_rate: float, seed: int):
+    """Pick the fault-injecting worker class and create a shared"""
+    if failure_rate <= 0.0:
+        return None, None
+    # Fault-injecting subclasses live in their own module so the production
+    from fault_injection import (
+        FailureDecider,
+        FaultInjectingHFWorker,
+        FaultInjectingVLLMWorker,
+    )
+    worker_cls = (
+        FaultInjectingVLLMWorker if backend == "vllm"
+        else FaultInjectingHFWorker
+    )
+    decider = FailureDecider.remote(seed=seed)
+    worker_kwargs = {"failure_rate": failure_rate, "decider": decider}
+    return worker_cls, worker_kwargs
+
 def print_summary(summary: dict, wall_elapsed: float) -> None:
     width = 62
     print(f"\n{'=' * width}")
@@ -212,7 +230,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--hook", action="store_true",
-        help="Run the mid-generation intervention demo after batch eval",
+        help="Run the mid-generation intervention demo after the main run",
     )                    
     parser.add_argument(
         "--output", type=str, default="results/results.jsonl",
@@ -236,14 +254,18 @@ def main() -> None:
     ray.init(ignore_reinit_error=True)
 
     tasks = make_tasks(args.tasks)
+    worker_cls, worker_kwargs = _build_fault_injection(
+        args.backend, args.failure_rate, args.seed
+    )
     coordinator = DistributedEvalCoordinator(
         n_workers=args.workers,
         model_name=args.model,
         backend=args.backend,
+        max_retries=2,
         task_timeout=args.task_timeout,
-        failure_rate=args.failure_rate,
-        seed=args.seed,
         output_path=args.output,
+        worker_cls=worker_cls,
+        worker_kwargs=worker_kwargs,
     )
 
     logger.info(

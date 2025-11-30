@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import time
 
 import ray
@@ -84,8 +83,7 @@ def _make_hook_criterion(hooks, tokenizer):
     return _HookCriterion()
 
 # HuggingFace pipeline backend
-@ray.remote
-class HFWorker:
+class HFWorkerImpl:
     """persistent worker: model loads once in __init__, reused across batches."""
     def __init__(
         self, 
@@ -101,8 +99,6 @@ class HFWorker:
         self.model_name = model_name
         self.task_timeout = task_timeout
         self.device = device
-        self.failure_rate = failure_rate
-        self._decider = decider
         self.tasks_completed = 0
         self.tasks_failed = 0
         self._scorer = RubricScorer()
@@ -133,10 +129,6 @@ class HFWorker:
                 f"Worker {self.worker_id} is poisoned. "
                 "Coordinator must replace worker."
             )
-	
-        if self._should_fail(tasks):
-            self.tasks_failed += len(tasks)
-            raise RuntimeError(f"injected failure (worker {self.worker_id})")
         
         from transformers import StoppingCriteriaList
 
@@ -183,15 +175,6 @@ class HFWorker:
             ))
         
         return results
-	
-    def _should_fail(self, tasks) -> bool:
-        if self._decider is None:
-            # Fallback for direct instantiation without a decider; not cross-worker deterministic.
-            return random.random() < self.failure_rate
-        batch_key = tuple(t.task_id for t in tasks)
-        return ray.get(
-            self._decider.should_fail.remote(batch_key, self.failure_rate)
-        )
 
     def evaluate_with_hooks(
         self,
@@ -256,24 +239,19 @@ class HFWorker:
         }
     
 # vLLM Backend
-@ray.remote(num_gpus=1)
-class VLLMWorker:
+class VLLMWorkerImpl:
     def __init__(
         self,
         worker_id: int,
         model_name: str,
         max_new_tokens: int = MAX_NEW_TOKENS,
         task_timeout: float = DEFAULT_TASK_TIMEOUT,
-        failure_rate: float = 0.0,
-        decider=None,
         tensor_parallel_size: int = 1,
     ) -> None:
         self.worker_id = worker_id
         self.model_name = model_name
         self.max_new_tokens = max_new_tokens
         self.task_timeout = task_timeout
-        self.failure_rate = failure_rate
-        self._decider = decider
         self.tensor_parallel_size = tensor_parallel_size
         self.tasks_completed = 0
         self.tasks_failed = 0
@@ -308,9 +286,6 @@ class VLLMWorker:
 
     async def evaluate_batch(self, tasks: list[EvalTask]) -> list[EvalResult]:
         """submit all prompts concurrently, gather terminal outputs."""
-        if await self._should_fail(tasks):
-            self.tasks_failed += len(tasks)
-            raise RuntimeError(f"injected failure (worker {self.worker_id})")
         
         start = time.perf_counter()
         request_ids: list[str] = []
@@ -346,8 +321,6 @@ class VLLMWorker:
         estimated_per_task = batch_latency / len(tasks)
 
         results = []
-        failure_rate: float = 0.0,
-        decider=None,
         for task, (response, token_ids) in zip(tasks, outputs):
             score, condition_scores = self._scorer.score(response, task)
             self.tasks_completed += 1
@@ -361,15 +334,6 @@ class VLLMWorker:
                 tokens_generated=len(token_ids),
             ))
         return results
-
-    async def _should_fail(self, tasks) -> bool:
-        if self._decider is None:
-            return random.random() < self.failure_rate
-        batch_key = tuple(t.task_id for t in tasks)
-        # ObjectRefs are awaitable inside async actor methods.
-        return await self._decider.should_fail.remote(
-            batch_key, self.failure_rate
-        )
 
     async def evaluate_with_hooks(
         self,
@@ -438,3 +402,6 @@ class VLLMWorker:
             "failed": self.tasks_failed,
             "poisoned": False,
         }
+
+HFWorker = ray.remote(HFWorkerImpl)
+VLLMWorker = ray.remote(VLLMWorkerImpl)

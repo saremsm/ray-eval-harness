@@ -543,17 +543,23 @@ def _coordinator_with_fake_workers(
         def remote(**kwargs):
             plan = plan_queue.popleft() if plan_queue else None
             return _FakeBackendActor(plan=plan, delay=delay, **kwargs)
+        
+    @staticmethod
+    def options(**_kwargs):
+        return _BackendStub  # ignore num_gpus etc. in tests
 
     coord = DistributedEvalCoordinator(
         n_workers=n_workers,
         model_name="fake-model",
+        backend="hf",
         max_retries=max_retries,
+        task_timeout=60.0,
         output_path="results/test.jsonl",
         batch_size=batch_size,
         aggregator_cls=_FakeAggregator,
+        worker_cls=_BackendStub,
     )
-    coord._worker_cls = _BackendStub
-
+    
     tasks = [make_task(f"t{i:03d}") for i in range(n_tasks)]
     return coord, tasks
 

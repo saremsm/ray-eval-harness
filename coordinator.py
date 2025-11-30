@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import logging
-import random
 import time
 from collections import deque
 
@@ -49,25 +47,6 @@ def backoff_seconds(retry_count: int) -> float:
     """exponential backoff, capped at 8s."""
     return min(8.0, 0.5 * (2 ** retry_count))
 
-def _stable_seed(*parts) -> int:
-    """Map an arbitrary tuple to a stable integer seed."""
-    digest = hashlib.sha256(repr(parts).encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big")
-
-class FailureDeciderImpl:
-    """Shared, deterministic fault-injection oracle."""
-    def __init__(self, seed: int = 0) -> None:
-        self._seed = seed
-        self._attempts: dict[tuple, int] = {}
-    def should_fail(self, batch_key: tuple, failure_rate: float) -> bool:
-        attempt = self._attempts.get(batch_key, 0)
-        self._attempts[batch_key] = attempt + 1
-        # failure_rate goes into the seed so different rates produce different
-        seed = _stable_seed(self._seed, batch_key, attempt, failure_rate)
-        rng = random.Random(seed)
-        return rng.random() < failure_rate
-FailureDecider = ray.remote(FailureDeciderImpl)
-
 class DistributedEvalCoordinator:
     """Work-Stealing coordinator across a pool of EvalWorker actors. aggregator_cls."""
     def __init__(
@@ -77,11 +56,12 @@ class DistributedEvalCoordinator:
         backend: str = "hf",
         max_retries: int = 2,
         task_timeout: float = 60.0,
-        failure_rate: float = 0.0,
-        seed: int = 0,
         output_path: str = "results/results.jsonl",
         batch_size: int = 4,
         aggregator_cls=ResultsAggregator,
+        worker_cls=None,
+        worker_kwargs: dict | None = None,
+        tensor_parallel_size: int = 1,
     ) -> None:
         self.n_workers = n_workers
         self.model_name = model_name
@@ -89,16 +69,15 @@ class DistributedEvalCoordinator:
         self.max_retries = max_retries
         # task_timeout is per-BATCH.
         self.task_timeout = task_timeout
-        self.failure_rate = failure_rate
-        self.seed = seed
-        self._failure_decider = None
         self.output_path = output_path
+        self.tensor_parallel_size = tensor_parallel_size
         self.batch_size = batch_size
 
         self._aggregator_cls = aggregator_cls
-        self._worker_cls = (
+        self._worker_cls = worker_cls or (
             VLLMWorker if backend == "vllm" else HFWorker
         )
+        self._extra_worker_kwargs = worker_kwargs or {}
     
     # Public Interface
 
@@ -386,6 +365,19 @@ class DistributedEvalCoordinator:
         if pending:
             batch, retry_count = pending.popleft()
             submit(worker_idx, batch, retry_count)
+
+    def _worker_factory(self):
+        """Return (constructor_callable, extra_kwargs) for configured backend."""
+        if self.backend == "vllm":
+            tp = self.tensor_parallel_size
+            return (
+                self._worker_cls.options(num_gpus=tp).remote,
+                {"tensor_parallel_size": tp, **self._extra_worker_kwargs},
+            )
+        return (
+            self._worker_cls.remote,
+            {**self._extra_worker_kwargs},
+        )
     
     def _create_workers(self) -> list:
         logger.info(
@@ -393,17 +385,13 @@ class DistributedEvalCoordinator:
             f"(backend={self.backend}, model={self.model_name}, "
             f"batch_size={self.batch_size})..."
         )
-        self._failure_decider = (
-            FailureDecider.remote(seed=self.seed)
-            if self.failure_rate > 0 else None
-        )
+        remote_ctor, extra_kwargs = self._worker_factory()
         workers = [
-            self._worker_cls.remote(
+            remote_ctor(
                 worker_id=i,
                 model_name=self.model_name,
                 task_timeout=self.task_timeout,
-                failure_rate=self.failure_rate,
-                decider=self._failure_decider,
+                **extra_kwargs,
             )
             for i in range(self.n_workers)
         ]
@@ -430,12 +418,12 @@ class DistributedEvalCoordinator:
 
         for attempt in range(max_attempts):
             try:
-                new_worker = self._worker_cls.remote(
+                remote_ctor, extra_kwargs = self._worker_factory()
+                new_worker = remote_ctor(
                     worker_id=failed_idx,
                     model_name=self.model_name,
                     task_timeout=self.task_timeout,
-                    failure_rate=self.failure_rate,
-                    decider=self._failure_decider,
+                    **extra_kwargs,
                 )
                 ray.get(new_worker.health_check.remote(), timeout=120.0)
                 validate_backend(new_worker)
