@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 import time
@@ -48,8 +49,12 @@ def backoff_seconds(retry_count: int) -> float:
     """exponential backoff, capped at 8s."""
     return min(8.0, 0.5 * (2 ** retry_count))
 
-@ray.remote
-class FailureDecider:
+def _stable_seed(*parts) -> int:
+    """Map an arbitrary tuple to a stable integer seed."""
+    digest = hashlib.sha256(repr(parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+class FailureDeciderImpl:
     """Shared, deterministic fault-injection oracle."""
     def __init__(self, seed: int = 0) -> None:
         self._seed = seed
@@ -58,9 +63,10 @@ class FailureDecider:
         attempt = self._attempts.get(batch_key, 0)
         self._attempts[batch_key] = attempt + 1
         # failure_rate goes into the seed so different rates produce different
-        seed = hash((self._seed, batch_key, attempt, failure_rate))
+        seed = _stable_seed(self._seed, batch_key, attempt, failure_rate)
         rng = random.Random(seed)
         return rng.random() < failure_rate
+FailureDecider = ray.remote(FailureDeciderImpl)
 
 class DistributedEvalCoordinator:
     """Work-Stealing coordinator across a pool of EvalWorker actors. aggregator_cls."""
