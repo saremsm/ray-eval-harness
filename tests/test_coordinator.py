@@ -98,6 +98,22 @@ class TestClassifyFailure:
             TimeoutError("Worker 3: batch of 4 exceeded 60.0s")
         ) == FailureKind.TRANSIENT
 
+# Per-backend default batch size
+class TestDefaultBatchSize:
+    def test_hf_default(self):
+        coord = make_coordinator(backend="hf")
+        assert coord.batch_size == 4
+    def test_vllm_default(self):
+        coord = make_coordinator(backend="vllm")
+        assert coord.batch_size == 64, (
+            "vLLM default must be large enough to keep continuous batching "
+            "saturated. 4 leaves the engine drained between batches."
+        )
+    def test_explicit_override(self):
+        coord = make_coordinator(backend="vllm", batch_size=16)
+        assert coord.batch_size == 16
+
+# _assign_next
 class TestAssignNext:
     def test_submits_with_correct_retry_count(self):
         """retry_count from tuple must reach submit(), not default of 0."""
@@ -544,9 +560,9 @@ def _coordinator_with_fake_workers(
             plan = plan_queue.popleft() if plan_queue else None
             return _FakeBackendActor(plan=plan, delay=delay, **kwargs)
         
-    @staticmethod
-    def options(**_kwargs):
-        return _BackendStub  # ignore num_gpus etc. in tests
+        @staticmethod
+        def options(**_kwargs):
+            return _BackendStub  # ignore num_gpus etc. in tests
 
     coord = DistributedEvalCoordinator(
         n_workers=n_workers,

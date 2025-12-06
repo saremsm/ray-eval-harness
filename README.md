@@ -36,15 +36,52 @@ pip install -r requirements.txt
 # CPU smoke test (no GPU needed)
 python main.py --dry-run
 
-# Larger run on CPU
-python main.py --tasks 200 --workers 4
+# Larger HF run on CPU
+python main.py --tasks 200 --workers 4 --backend hf
 
 # vLLM run (requires GPU + a vLLM-compatible model)
 python main.py --tasks 1000 --workers 1 --backend vllm \
     --model Qwen/Qwen2.5-1.5B
+
+# Override the per-backend default batch size
+python main.py --tasks 1000 --workers 1 --backend vllm \
+    --model Qwen/Qwen2.5-1.5B --batch-size 128
+
+# Mid-generation hook demo
+python main.py --hook --backend hf
 ```
 
+Inject failures to exercise the retry path. The fault-injection RNG is seeded, so `--seed 42` reproduces the same failure pattern across runs:
+```bash
+python main.py --tasks 200 --workers 1 --backend vllm \
+    --model Qwen/Qwen2.5-1.5B --batch-size 16 \
+    --failure-rate 0.3 --seed 42
+```
+
+## Performance
+
+Cloud GPU. Lambda A10 (24GB VRAM), `Qwen/Qwen2.5-1.5B`, vLLM backend, 1 worker, 1000 tasks per row, greedy decoding, max_new_tokens=80.
+| `--batch-size` | Throughput (tasks/s) | Engine calls |
+| -------------: | -------------------: | -----------: |
+|              4 |                  6.0 |          250 |
+|             16 |                 22.8 |           63 |
+|             32 |                 44.5 |           32 |
+|             64 |                 75.1 |           16 |
+|            128 |                117.1 |            8 |
+|            256 |                120.1 |            4 |
+Throughput climbs steeply with batch size because continuous batching only saturates when many requests are in flight; the default of 64 captures most of the available throughput (12.7× the batch=4 baseline) without committing all of GPU memory to in-flight KV cache.
+From 128 to 256 the sweep gains ~2.5% (117.1 → 120.1 tasks/s) for real memory: past saturation, extra batch size buys KV-cache commitment, not speed, and a default that pre-spends the whole cache leaves nothing for longer generations or the hooked path sharing the engine.
+The batch-4 row is the control: 5.91 tasks/s on the old harness vs 6.0 on this one, same hardware - the harness reproduces the old behavior when forced to the old batch size, so the climb up the table reflects a real change in how the harness drives the engine, not different hardware or a different model.
+**Laptop CPU baseline.** Lenovo IdeaPad 82FE, Intel Core i5-1135G7, `distilgpt2`, HF backend, 4 workers, 50 tasks. Included for the smoke-test fault tolerance comparison, not for absolute throughput. `distilgpt2` scores poorly on the trivia rubric because it's an 82M-parameter model trained mostly on web text; that's the model, not the harness.
+| Scenario (50 tasks, 4 workers)      | Outcome                        |
+| ----------------------------------- | ------------------------------ |
+| Clean run                           | 50/50 succeeded                |
+| `--failure-rate 0.3 --seed 42`      | 50/50 after retries            |
+| One worker killed mid-run           | 50/50; run continues at n-1    |
+| Kill + `--failure-rate 0.3`         | 50/50; replacement + retries   |
+
 ## Reproducibility
+
 Both backends use greedy decoding (`temperature=0.0` on vLLM; the HF text-generation pipeline defaults to `do_sample=False`). Outputs are **empirically stable across runs** (table below), but greedy decoding under continuous batching is not *guaranteed* bitwise-deterministic: batch composition changes kernel shapes and reduction orders, and composition varies with retry timing.
 Failure injection goes through a single shared `FailureDecider` actor that all fault-injecting workers query. The decider tracks per-batch attempt counts globally, so a decision is a function of `(seed, batch_content, attempt_number)` and not of which worker happened to receive the batch.
 Verified on GPU: 200 tasks, 13 batches at batch_size=16, `--failure-rate 0.3 --seed 42`. Two independent runs on a fresh actor pool produced identical outcomes:

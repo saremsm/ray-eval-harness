@@ -20,6 +20,11 @@ HUNG_REF_THRESHOLD_S = 240.0
 # Poll interval when no refs are completing.
 RETRY_POLL_INTERVAL = 1.0
 
+# Per-backend batch-size defaults: HF over-batches past 4; vLLM's continuous
+# batching starves below 64.
+DEFAULT_BATCH_SIZE_HF = 4
+DEFAULT_BATCH_SIZE_VLLM = 64
+
 _DETERMINISTIC_PATTERNS = (
     "token indices sequence length",
     "index out of range",
@@ -57,7 +62,7 @@ class DistributedEvalCoordinator:
         max_retries: int = 2,
         task_timeout: float = 60.0,
         output_path: str = "results/results.jsonl",
-        batch_size: int = 4,
+        batch_size: int | None = None,
         aggregator_cls=ResultsAggregator,
         worker_cls=None,
         worker_kwargs: dict | None = None,
@@ -71,6 +76,11 @@ class DistributedEvalCoordinator:
         self.task_timeout = task_timeout
         self.output_path = output_path
         self.tensor_parallel_size = tensor_parallel_size
+        if batch_size is None:
+            batch_size = (
+                DEFAULT_BATCH_SIZE_VLLM if backend == "vllm"
+                else DEFAULT_BATCH_SIZE_HF
+            )
         self.batch_size = batch_size
 
         self._aggregator_cls = aggregator_cls

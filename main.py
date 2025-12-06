@@ -214,6 +214,13 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--batch-size", type=int, default=None, dest="batch_size",
+        help=(
+            "Tasks per actor call. Default depends on backend: 4 for HF, "
+            "64 for vLLM. Increase for vLLM throughput tuning."
+        ),
+    )
+    parser.add_argument(
         "--task-timeout", type=float, default=60.0, dest="task_timeout",
         help=(
             "Per-BATCH timeout in seconds, enforced inside the worker "
@@ -264,12 +271,13 @@ def main() -> None:
         max_retries=2,
         task_timeout=args.task_timeout,
         output_path=args.output,
+        batch_size=args.batch_size,
         worker_cls=worker_cls,
         worker_kwargs=worker_kwargs,
     )
 
     logger.info(
-        f"Starting: tasks={args.tasks}, workers={args.workers}, "
+        f"Starting: {args.tasks} tasks, {args.workers} workers, " 
         f"backend={args.backend}, model={args.model}"
         f"failure_rate={args.failure_rate}, seed={args.seed}"
     )
