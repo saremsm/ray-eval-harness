@@ -128,12 +128,20 @@ def print_summary(summary: dict, wall_elapsed: float) -> None:
         ("Total tasks",       summary.get("total")),
         ("Succeeded",         summary.get("succeeded")),
         ("Failed",            summary.get("failed")),
+        ("Stopped early",     summary.get("stopped_early", 0)),
         ("Success rate",      f"{summary.get('success_rate', 0):.1%}"),
         ("Mean score",        f"{summary.get('mean_score', 0):.3f}"),
         ("Min / Max score",   f"{summary.get('min_score', 0):.3f} / "
                               f"{summary.get('max_score', 0):.3f}"),
-        ("Mean latency",      f"{summary.get('mean_latency_s', 0):.2f}s"),
-        ("p99 latency",       f"{summary.get('p99_latency_s', 0):.2f}s"),
+        # Per-task latency is an ESTIMATE (batch wall time / batch size)
+        ("Mean latency",      f"{summary.get('mean_latency_s', 0):.2f}s  "
+                              "(est.: batch / batch_size)"),
+        ("p99 latency",       f"{summary.get('p99_latency_s', 0):.2f}s  "
+                              "(est.; see batch latency)"),
+        ("Mean batch latency", f"{summary.get('mean_batch_latency_s', 0):.2f}s  "
+                               "(measured, task-weighted)"),
+        ("p99 batch latency", f"{summary.get('p99_batch_latency_s', 0):.2f}s  "
+                              "(measured, task-weighted)"),
         ("Mean tokens",       f"{summary.get('mean_tokens_generated', 0):.1f}"),
         ("Throughput",        f"{summary.get('throughput_per_s', 0):.1f} tasks/s"),
         ("Wall time",         f"{wall_elapsed:.1f}s"),
@@ -196,11 +204,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--failure-rate", type=float, default=0.0, dest="failure_rate",
-        help="Fraction of batches to fail artificially.",
+        help=(
+            "Fraction of batches to fail artificially. Triggers the "
+            "fault-injecting worker subclass (default: 0.0)"
+        ),
     )
     parser.add_argument(
         "--seed", type=int, default=0,
-        help="Seed for fault injection RNG.",
+        help=(
+            "Seed for fault injection RNG. Same seed + failure_rate "
+            "reproduces the same failure pattern (default: 0)"
+        ),
     )
     parser.add_argument(
         "--model", type=str, default="distilgpt2",
@@ -278,7 +292,7 @@ def main() -> None:
 
     logger.info(
         f"Starting: {args.tasks} tasks, {args.workers} workers, " 
-        f"backend={args.backend}, model={args.model}"
+        f"backend={args.backend}, model={args.model}, "
         f"failure_rate={args.failure_rate}, seed={args.seed}"
     )
 

@@ -170,6 +170,7 @@ class HFWorkerImpl:
                 score=score,
                 response=response,
                 latency_seconds=estimated_per_task,
+                batch_latency_seconds=batch_latency,
                 worker_id=self.worker_id,
                 condition_scores=condition_scores,
             ))
@@ -181,8 +182,7 @@ class HFWorkerImpl:
         task: EvalTask,
         hooks: list,  # list[InterventionHook]
     ) -> EvalResult:
-        """per-token hooks via TextIteratorStreamer; generation runs in a background
-        thread."""
+        """per-token hooks via StoppingCriteria."""
         if self._poisoned:
             raise RuntimeError(f"Worker {self.worker_id} poisoned, replace me")
 
@@ -217,6 +217,7 @@ class HFWorkerImpl:
             score=score,
             response=response,
             latency_seconds=elapsed,
+            batch_latency_seconds=None,
             hooked=True,
             worker_id=self.worker_id,
             condition_scores=condition_scores,
@@ -329,6 +330,7 @@ class VLLMWorkerImpl:
                 score=score,
                 response=response,
                 latency_seconds=estimated_per_task,
+                batch_latency_seconds=batch_latency,
                 worker_id=self.worker_id,
                 condition_scores=condition_scores,
                 tokens_generated=len(token_ids),
@@ -383,6 +385,7 @@ class VLLMWorkerImpl:
             score=score,
             response=accumulated,
             latency_seconds=elapsed,
+            batch_latency_seconds=None,
             hooked=True,
             worker_id=self.worker_id,
             condition_scores=condition_scores,

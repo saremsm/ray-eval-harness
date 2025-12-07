@@ -479,6 +479,7 @@ class _FakeBackendActor:
                     score=1.0,
                     response="ok",
                     latency_seconds=0.01,
+                    batch_latency_seconds=0.01,
                     worker_id=self.worker_id,
                 )
                 for t in tasks

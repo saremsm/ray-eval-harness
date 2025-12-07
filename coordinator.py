@@ -268,6 +268,7 @@ class DistributedEvalCoordinator:
                         score=0.0,
                         response="",
                         latency_seconds=0.0,
+                        batch_latency_seconds=None,
                         failed=True,
                         worker_id=worker_idx,
                         error=(
@@ -337,6 +338,7 @@ class DistributedEvalCoordinator:
                 score=0.0,
                 response="",
                 latency_seconds=0.0,
+                batch_latency_seconds=None,
                 failed=True,
                 worker_id=worker_idx,
                 error=str(exc),

@@ -37,6 +37,7 @@ class EvalResult:
     response: str
     latency_seconds: float
     worker_id: int
+    batch_latency_seconds: Optional[float] = None
     failed: bool = False
     hooked: bool = False
     error: Optional[str] = None
@@ -56,6 +57,7 @@ class EvalResult:
             "score": self.score,
             "response": self.response,
             "latency_seconds": self.latency_seconds,
+            "batch_latency_seconds": self.batch_latency_seconds,
             "failed": self.failed,
             "hooked": self.hooked,
             "worker_id": self.worker_id,

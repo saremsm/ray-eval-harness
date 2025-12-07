@@ -40,7 +40,9 @@ class ResultsAggregator:
         self._score_max = float("-inf")
         self._latency_sum = 0.0
         self._latency_samples: list[float] = []
+        self._batch_latency_samples: list[float] = []
         self._tokens_total = 0
+        self._stopped_early_count = 0
         self._per_worker: dict[int, int] = {}
         self._all_condition_scores: list[dict[str, float]] = []
 
@@ -59,7 +61,14 @@ class ResultsAggregator:
             self._score_max = max(self._score_max, result.score)
             self._latency_sum += result.latency_seconds
             self._latency_samples.append(result.latency_seconds)
+            if result.batch_latency_seconds is not None:
+                # task-weighted: each task contributes its batch's wall time.
+                self._batch_latency_samples.append(
+                    result.batch_latency_seconds
+                )
             self._tokens_total += result.tokens_generated
+            if result.stopped_early:
+                self._stopped_early_count += 1
             if result.condition_scores:
                 self._all_condition_scores.append(result.condition_scores)
         else:
@@ -91,6 +100,11 @@ class ResultsAggregator:
             self._tokens_total / self._succeeded if self._succeeded > 0 else 0.0
         )
         p99 = _percentile(sorted(self._latency_samples), 0.99)
+        batch_sorted = sorted(self._batch_latency_samples)
+        p99_batch = _percentile(batch_sorted, 0.99)
+        mean_batch = (
+            sum(batch_sorted) / len(batch_sorted) if batch_sorted else 0.0
+        )
 
         condition_stats = RubricScorer.aggregate_condition_scores(
             self._all_condition_scores
@@ -104,6 +118,7 @@ class ResultsAggregator:
             "total_intake": self.total_tasks,
             "succeeded": self._succeeded,
             "failed": self._failed,
+            "stopped_early": self._stopped_early_count,
             "success_rate": success_rate,
             "mean_score": mean_score,
             "min_score": (
@@ -114,6 +129,8 @@ class ResultsAggregator:
             ),
             "mean_latency_s": mean_latency,
             "p99_latency_s": p99,
+            "mean_batch_latency_s": mean_batch,
+            "p99_batch_latency_s": p99_batch,
             "mean_tokens_generated": mean_tokens, 
             "total_elapsed_s": elapsed,
             "throughput_per_s": throughput,
