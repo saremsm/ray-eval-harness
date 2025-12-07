@@ -424,7 +424,13 @@ class DistributedEvalCoordinator:
     ) -> bool:
         """replace a worker with bounded retries."""
         # TODO: still blocks on model load. need standby pool for big models.
+        old = workers[failed_idx]
         workers[failed_idx] = None  # nothing dispatches here while we work
+        if old is not None:
+            try:
+                ray.kill(old, no_restart=True)
+            except Exception:
+                pass  # already dead / not a real handle in tests
 
         logger.warning(f"Replacing worker {failed_idx}")
 

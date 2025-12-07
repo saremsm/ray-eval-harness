@@ -634,3 +634,29 @@ class TestCoordinatorIntegration:
             f"retry exhaustion. Summary: {summary}"
         )
         assert summary["succeeded"] + summary["failed"] == 8
+
+    def test_replace_worker_kills_old_actor(self, patched_ray):
+        """Must ray.kill the old actor before building the replacement: a dropped
+        handle leaves a GPU-claiming actor holding its resources, so the
+        replacement never schedules."""
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[
+                ["poison"],
+                ["ok"] * 20,
+            ],
+            n_tasks=8,
+            max_retries=2,
+        )
+        summary = coord.run(tasks)
+        kill_mock = patched_ray["kill"]
+        assert kill_mock.called, (
+            "Replacing a worker must force-kill the old actor to free "
+            "its resources."
+        )
+        killed_actor = kill_mock.call_args[0][0]
+        assert isinstance(killed_actor, _FakeBackendActor), (
+            f"ray.kill must receive the old actor handle, got "
+            f"{killed_actor!r}"
+        )
+        assert kill_mock.call_args[1].get("no_restart") is True
+        assert summary["succeeded"] == 8
