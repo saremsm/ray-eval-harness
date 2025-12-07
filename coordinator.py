@@ -160,6 +160,33 @@ class DistributedEvalCoordinator:
             submit(available.pop(0), batch, retry_count)
         
         while active or deferred or pending:
+            # All workers dead => nothing can save us.
+            if all(w is None for w in workers):
+                logger.error(
+                    f"All {self.n_workers} workers are dead and unreplaceable. "
+                    f"Aborting with {len(pending)} pending and "
+                    f"{len(deferred)} deferred batches unprocessed."
+                )
+                # Record terminal failures for every undispatched task so the JSONL accounts.
+                undispatched = list(pending) + [
+                    (batch, rc) for _, batch, rc in deferred
+                ]
+                self._record(aggregator, [
+                    EvalResult(
+                        task_id=task.task_id,
+                        score=0.0,
+                        response="",
+                        latency_seconds=0.0,
+                        batch_latency_seconds=None,
+                        failed=True,
+                        worker_id=-1,
+                        error="all workers dead before dispatch",
+                        failure_kind=FailureKind.TRANSIENT,
+                    )
+                    for batch, _ in undispatched
+                    for task in batch
+                ])
+                break
             promote_ready_retries()
             dispatch_pending_to_idle()
 
@@ -197,7 +224,6 @@ class DistributedEvalCoordinator:
                         deferred.append((ready_at, batch, retry_count + 1))
 
                 self._assign_next(worker_idx, pending, submit)
-            else:
                 # Scan every iteration, not only when ray.wait returns empty: under steady
                 # completions that gate starves exactly when the system is busiest.
                 self._handle_timeouts(

@@ -660,3 +660,26 @@ class TestCoordinatorIntegration:
         )
         assert kill_mock.call_args[1].get("no_restart") is True
         assert summary["succeeded"] == 8
+
+    def test_run_terminates_when_all_workers_die(self, patched_ray, monkeypatch):
+        """If every worker fails replacement, run() must terminate rather than spinning forever."""
+        # Both workers poison on first call, and replacement always fails.
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["poison"], ["poison"]],
+            n_tasks=8,
+            max_retries=2,
+        )
+        # Force every replacement attempt to fail.
+        monkeypatch.setattr(
+            coord, "_replace_worker",
+            lambda workers, idx, max_attempts=3: (
+                workers.__setitem__(idx, None) or False
+            ),
+        )
+        summary = coord.run(tasks)
+        assert summary["total"] == 8, (
+            "Every task must be accounted for in the summary, even when "
+            "all workers die before completion."
+        )
+        assert summary["failed"] == 8
+        assert summary["succeeded"] == 0
