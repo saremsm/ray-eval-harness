@@ -67,6 +67,7 @@ class DistributedEvalCoordinator:
         worker_cls=None,
         worker_kwargs: dict | None = None,
         tensor_parallel_size: int = 1,
+        hf_device: int = -1,
     ) -> None:
         self.n_workers = n_workers
         self.model_name = model_name
@@ -76,6 +77,7 @@ class DistributedEvalCoordinator:
         self.task_timeout = task_timeout
         self.output_path = output_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.hf_device = hf_device
         if batch_size is None:
             batch_size = (
                 DEFAULT_BATCH_SIZE_VLLM if backend == "vllm"
@@ -159,6 +161,12 @@ class DistributedEvalCoordinator:
             batch, retry_count = pending.popleft()
             submit(available.pop(0), batch, retry_count)
         
+        if not available and not active:
+            raise RuntimeError(
+                "All workers failed to start. Check model_name, GPU "
+                "availability, and Ray resources."
+            )
+        
         while active or deferred or pending:
             # All workers dead => nothing can save us.
             if all(w is None for w in workers):
@@ -224,16 +232,16 @@ class DistributedEvalCoordinator:
                         deferred.append((ready_at, batch, retry_count + 1))
 
                 self._assign_next(worker_idx, pending, submit)
-                # Scan every iteration, not only when ray.wait returns empty: under steady
-                # completions that gate starves exactly when the system is busiest.
-                self._handle_timeouts(
-                    active=active,
-                    ref_timeouts=ref_timeouts,
-                    workers=workers,
-                    pending=pending,
-                    submit=submit,
-                    aggregator=aggregator,
-                )
+            # Scan every iteration, not only when ray.wait returns empty: under steady
+            # completions that gate starves exactly when the system is busiest.
+            self._handle_timeouts(
+                active=active,
+                ref_timeouts=ref_timeouts,
+                workers=workers,
+                pending=pending,
+                submit=submit,
+                aggregator=aggregator,
+            )
         
         live_workers = [w for w in workers if w is not None]
         worker_stats = ray.get([w.get_stats.remote() for w in live_workers])
@@ -314,15 +322,15 @@ class DistributedEvalCoordinator:
                 submit(worker_idx, batch_to_send, rc)
 
     # Helpers
-    def _record(
-        self, 
-        aggregator: object, 
-        results: list[EvalResult]
-    ) -> None:
+    def _record(self, aggregator: object, results: list[EvalResult]) -> None:
         for result in results:
             ray.get(aggregator.add_result.remote(result))
     
-    def _handle_success(self, results: list[EvalResult], aggregator: object,) -> None:
+    def _handle_success(
+        self, 
+        results: list[EvalResult], 
+        aggregator: object,
+    ) -> None:
         self._record(aggregator, results)
 
     def _handle_failure(
@@ -412,9 +420,22 @@ class DistributedEvalCoordinator:
                 self._worker_cls.options(num_gpus=tp).remote,
                 {"tensor_parallel_size": tp, **self._extra_worker_kwargs},
             )
+        if self.hf_device >= 0:
+            # Claim a GPU fraction so Ray accounts for replicas instead of silently
+            frac = 1.0 / self.n_workers
+            logger.warning(
+                f"HF backend on GPU: claiming num_gpus={frac:.2f} per "
+                f"worker. Fractional GPUs are accounting, not isolation; "
+                f"ensure '{self.model_name}' fits {self.n_workers}x on "
+                f"one device."
+            )
+            return (
+                self._worker_cls.options(num_gpus=frac).remote,
+                {"device": self.hf_device, **self._extra_worker_kwargs},
+            )
         return (
             self._worker_cls.remote,
-            {**self._extra_worker_kwargs},
+            {"device": self.hf_device, **self._extra_worker_kwargs},
         )
     
     def _create_workers(self) -> list:
@@ -433,6 +454,21 @@ class DistributedEvalCoordinator:
             )
             for i in range(self.n_workers)
         ]
+        # Bounded init barrier: without a timeout.
+        WORKER_INIT_TIMEOUT_S = 120.0
+        try:
+            ray.get(
+                [w.health_check.remote() for w in workers],
+                timeout=WORKER_INIT_TIMEOUT_S,
+            )
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RuntimeError(
+                f"Workers did not become healthy within "
+                f"{WORKER_INIT_TIMEOUT_S}s. Most common cause: "
+                f"--workers ({self.n_workers}) exceeds available GPUs, or "
+                f"the model '{self.model_name}' failed to load. Check "
+                f"`ray status` and worker logs."
+            ) from exc
 
         ray.get([w.health_check.remote() for w in workers])
 

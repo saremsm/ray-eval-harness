@@ -91,8 +91,6 @@ class HFWorkerImpl:
         model_name: str = "distilgpt2",
         task_timeout: float = DEFAULT_TASK_TIMEOUT,
         device: int = -1,
-        failure_rate: float = 0.0,
-        decider=None,
     ) -> None:
         """device: -1 for CPU, 0+ for CUDA devices."""
         self.worker_id = worker_id

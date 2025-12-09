@@ -228,6 +228,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--hf-device", type=int, default=-1, dest="hf_device",
+        help=(
+            "Device for HF backend: -1 for CPU, 0+ for the corresponding "
+            "CUDA device. With N workers on a GPU, each claims num_gpus="
+            "1/N - accounting, not isolation: the model must fit N times "
+            "(default: -1)"
+        ),
+    )
+    parser.add_argument(
         "--batch-size", type=int, default=None, dest="batch_size",
         help=(
             "Tasks per actor call. Default depends on backend: 4 for HF, "
@@ -288,6 +297,7 @@ def main() -> None:
         batch_size=args.batch_size,
         worker_cls=worker_cls,
         worker_kwargs=worker_kwargs,
+        hf_device=args.hf_device,
     )
 
     logger.info(
@@ -305,7 +315,7 @@ def main() -> None:
     if args.hook: run_hooked_demo(args.model)
     ray.shutdown()
 
-def run_hooked_demo(model_name: str) -> None:
+def run_hooked_demo(model_name: str, hf_device: int) -> None:
     """Single-task hook demo."""
     print("\n" + "=" * 62)
     print("  Mid-generation intervention demo (hooked evaluation)")
@@ -314,6 +324,7 @@ def run_hooked_demo(model_name: str) -> None:
     worker = HFWorker.remote(
         worker_id=99,
         model_name=model_name,
+        device=hf_device,
     )
     ray.get(worker.health_check.remote())
 

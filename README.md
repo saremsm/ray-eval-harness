@@ -39,6 +39,10 @@ python main.py --dry-run
 # Larger HF run on CPU
 python main.py --tasks 200 --workers 4 --backend hf
 
+# HF run on a single GPU (each of N workers claims num_gpus=1/N;
+# accounting, not isolation - the model must fit N times)
+python main.py --tasks 200 --workers 4 --backend hf --hf-device 0
+
 # vLLM run (requires GPU + a vLLM-compatible model)
 python main.py --tasks 1000 --workers 1 --backend vllm \
     --model Qwen/Qwen2.5-1.5B
