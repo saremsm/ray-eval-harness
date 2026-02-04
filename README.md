@@ -95,7 +95,7 @@ The batch-4 row is the control: 5.91 tasks/s on the old harness vs 6.0 on this o
 
 ## Reproducibility
 
-Both backends use greedy decoding (`temperature=0.0` on vLLM; the HF text-generation pipeline defaults to `do_sample=False`). Outputs are **empirically stable across runs** (table below), but greedy decoding under continuous batching is not *guaranteed* bitwise-deterministic: batch composition changes kernel shapes and reduction orders, and composition varies with retry timing.
+Both backends use greedy decoding (`temperature=0.0` on vLLM; the HF text-generation pipeline defaults to `do_sample=False`). Outputs are **empirically stable across runs** (table below), but greedy decoding under continuous batching is not *guaranteed* bitwise-deterministic: batch composition changes kernel shapes and reduction orders, and composition varies with retry timing (backoff jitter deliberately uses an unseeded RNG). Failure *decisions* are fully deterministic; wall-clock scheduling is not.
 
 Failure injection goes through a single shared `FailureDecider` actor that all fault-injecting workers query. The decider tracks per-batch attempt counts globally, so a decision is a function of `(seed, batch_content, attempt_number)` and not of which worker happened to receive the batch.
 

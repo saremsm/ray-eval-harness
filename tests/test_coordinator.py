@@ -1,5 +1,6 @@
 import time
 import pytest
+import random
 from unittest.mock import patch
 from collections import deque
 
@@ -9,6 +10,7 @@ from coordinator import (
     DistributedEvalCoordinator,
     HUNG_REF_THRESHOLD_S,
     classify_failure,
+    backoff_seconds,
     validate_backend,
 )
 
@@ -91,6 +93,34 @@ class TestClassifyFailure:
         assert classify_failure(
             IndexError("index out of range")
         ) == FailureKind.DETERMINISTIC
+
+# Backoff Seconds
+
+class TestBackoffSeconds:
+    def test_first_retry_within_bound(self):
+        rng = random.Random(0)
+        for _ in range(100):
+            assert 0.0 <= backoff_seconds(0, rng) <= 0.5
+    def test_second_retry_within_bound(self):
+        rng = random.Random(0)
+        for _ in range(100):
+            assert 0.0 <= backoff_seconds(1, rng) <= 1.0
+    def test_cap_at_eight(self):
+        rng = random.Random(0)
+        for _ in range(100):
+            assert 0.0 <= backoff_seconds(100, rng) <= 8.0
+    def test_jitter_spreads_values(self):
+        """Full jitter must produce a spread of values, not a single point."""
+        rng = random.Random(42)
+        samples = [backoff_seconds(3, rng) for _ in range(50)]
+        assert len(set(round(s, 3) for s in samples)) > 10, (
+            "Jitter should produce varied delays; if all samples cluster "
+            "at one value, jitter isn't being applied."
+        )
+    def test_non_negative(self):
+        rng = random.Random(0)
+        for retry_count in range(20):
+            assert backoff_seconds(retry_count, rng) >= 0
     
     def test_worker_batch_timeout_is_transient(self):
         """The worker's per-batch TimeoutError (no longer a poisoning RuntimeError)"""

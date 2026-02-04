@@ -5,6 +5,7 @@ import time
 from collections import deque
 
 import ray
+import random
 
 from aggregator import ResultsAggregator
 from types_ import EvalResult, EvalTask, FailureKind
@@ -13,6 +14,9 @@ from utils import make_batches
 from worker import HFWorker, VLLMWorker
 
 logger = logging.getLogger(__name__)
+
+# Bounded wait for the whole pool to answer its first health check.
+WORKER_INIT_TIMEOUT_S = 120.0
 
 # Wall-clock threshold for treating an outstanding ref as hung.
 HUNG_REF_THRESHOLD_S = 240.0
@@ -48,9 +52,12 @@ def classify_failure(exc: Exception) -> FailureKind:
             return FailureKind.DETERMINISTIC
     return FailureKind.TRANSIENT
 
-def backoff_seconds(retry_count: int) -> float:
-    """exponential backoff, capped at 8s."""
-    return min(8.0, 0.5 * (2 ** retry_count))
+def backoff_seconds(retry_count: int, rng: random.Random | None = None) -> float:
+    """exponential backoff, full jitter, cap 8s. full jitter (U[0, base]):
+    simultaneous failures otherwise retry in sync."""
+    base = min(8.0, 0.5 * (2 ** retry_count))
+    r = rng if rng is not None else random
+    return r.uniform(0, base)
 
 class DistributedEvalCoordinator:
     """Work-Stealing coordinator across a pool of EvalWorker actors. aggregator_cls."""
@@ -469,8 +476,6 @@ class DistributedEvalCoordinator:
                 f"the model '{self.model_name}' failed to load. Check "
                 f"`ray status` and worker logs."
             ) from exc
-
-        ray.get([w.health_check.remote() for w in workers])
 
         for worker in workers:
             validate_backend(worker)

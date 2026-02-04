@@ -1,4 +1,9 @@
-ray[default]>=2.50.0
-vllm>=0.15.0
-transformers>=4.56.0
+# Pinned to the versions the README benchmarks were run against.
+# Unbounded floors on fast-moving, mutually-pinning packages (vLLM pins
+# its own torch; the AsyncLLMEngine import path is version-sensitive)
+# are a reproducibility hazard. Bump deliberately and
+# re-run the test suite + a GPU smoke run when you do.
+ray[default]==2.50.0
+transformers>=4.56.0, <5.0.0
+vllm==0.15.0
 pytest>=7.0.0
