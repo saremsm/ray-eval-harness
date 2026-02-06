@@ -45,6 +45,7 @@ class EvalResult:
     condition_scores: dict[str, float] = field(default_factory=dict)
     tokens_generated: int = 0
     stopped_early: bool = False
+    hook_state: dict = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
@@ -68,6 +69,7 @@ class EvalResult:
             "condition_scores": self.condition_scores,
             "tokens_generated": self.tokens_generated,
             "stopped_early": self.stopped_early,
+            "hook_state": self.hook_state,
         }
 
 # EvalBackend Protocol

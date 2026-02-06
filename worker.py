@@ -17,6 +17,16 @@ HF_MICRO_BATCH_SIZE = 8
 # Per-batch wall-clock budget for one evaluate call (seconds). 
 DEFAULT_TASK_TIMEOUT = 60.0
 
+	
+def _collect_hook_state(hooks: list) -> dict:
+    """gather hook-observable state to return via EvalResult.hook_state."""
+    state: dict = {}
+    for hook in hooks:
+        triggered = getattr(hook, "triggered_by", None)
+        if triggered is not None:
+            state["triggered_by"] = triggered
+    return state
+
 # Stopping Criteria Helpers (HF Backend)
 def _make_timeout_criterion(deadline: float):
     """StoppingCriteria that fires once monotonic time passes deadline."""
@@ -221,6 +231,7 @@ class HFWorkerImpl:
             condition_scores=condition_scores,
             tokens_generated=criterion.token_count,
             stopped_early=criterion.stopped_early,
+            hook_state=_collect_hook_state(hooks),
         )
 
     def health_check(self) -> bool:
@@ -389,6 +400,7 @@ class VLLMWorkerImpl:
             condition_scores=condition_scores,
             tokens_generated=token_count,
             stopped_early=stopped_early,
+            hook_state=_collect_hook_state(hooks),
         )
 
     async def health_check(self) -> bool:

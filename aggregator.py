@@ -74,8 +74,8 @@ class ResultsAggregator:
         else:
             self._failed += 1
         
-        with self.output_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
+        self._fh.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
+        self._fh.flush()
 
         elapsed = time.perf_counter() - self.start_time
         rate = self._count / elapsed if elapsed > 0 else 0.0

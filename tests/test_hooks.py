@@ -2,7 +2,7 @@ import logging
 
 import pytest
 from hooks import EarlyStoppingHook, LoggingHook
-
+from types_ import EvalResult
 
 class TestEarlyStoppingHook:
     def test_stops_on_trigger(self):
@@ -81,3 +81,22 @@ class TestLoggingHook:
             "An INFO-level hook must emit visible records under an "
             "INFO-configured logger (the demo relies on this)."
         )
+
+	
+class TestHookStateReturnPath:
+    def test_eval_result_serializes_hook_state(self):
+        """hook_state must survive to_dict."""
+        r = EvalResult(
+            task_id="t", score=1.0, response="Paris",
+            latency_seconds=0.1, worker_id=0,
+            hooked=True, stopped_early=True,
+            hook_state={"triggered_by": "Paris"},
+        )
+        d = r.to_dict()
+        assert d["hook_state"] == {"triggered_by": "Paris"}
+    def test_hook_state_defaults_empty(self):
+        r = EvalResult(
+            task_id="t", score=0.0, response="",
+            latency_seconds=0.0, worker_id=0,
+        )
+        assert r.hook_state == {}

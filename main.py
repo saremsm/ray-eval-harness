@@ -312,7 +312,7 @@ def main() -> None:
 
     print_summary(summary, wall_elapsed)
 
-    if args.hook: run_hooked_demo(args.model)
+    if args.hook: run_hooked_demo(args.model, args.hf_device)
     ray.shutdown()
 
 def run_hooked_demo(model_name: str, hf_device: int) -> None:
@@ -353,8 +353,9 @@ def run_hooked_demo(model_name: str, hf_device: int) -> None:
     print(f"  Score:           {result.score:.3f}")
     print(f"  Tokens generated:{result.tokens_generated}")
     print(f"  Stopped early:   {result.stopped_early}")
-    if stop_hook.triggered_by:
-        print(f"  Triggered by:    {stop_hook.triggered_by!r}")
+    triggered = result.hook_state.get("triggered_by")
+    if triggered:
+        print(f"  Triggered by:    {triggered!r}")
     print("=" * 62 + "\n")
     
 if __name__ == "__main__":

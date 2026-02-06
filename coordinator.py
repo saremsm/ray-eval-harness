@@ -93,6 +93,7 @@ class DistributedEvalCoordinator:
         self.batch_size = batch_size
 
         self._aggregator_cls = aggregator_cls
+        self._write_refs: list = []
         self._worker_cls = worker_cls or (
             VLLMWorker if backend == "vllm" else HFWorker
         )
@@ -109,6 +110,7 @@ class DistributedEvalCoordinator:
             total_tasks=len(tasks), 
             output_path=self.output_path,
         )
+        self._write_refs = []
         # Ready to dispatch.
         pending: deque[tuple[list[EvalTask], int]] = deque(
             (batch, 0) for batch in make_batches(tasks, self.batch_size)
@@ -249,7 +251,10 @@ class DistributedEvalCoordinator:
                 submit=submit,
                 aggregator=aggregator,
             )
-        
+        if self._write_refs:
+            ray.get(self._write_refs)
+            self._write_refs = []
+
         live_workers = [w for w in workers if w is not None]
         worker_stats = ray.get([w.get_stats.remote() for w in live_workers])
         summary = ray.get(aggregator.get_summary.remote())
@@ -331,7 +336,7 @@ class DistributedEvalCoordinator:
     # Helpers
     def _record(self, aggregator: object, results: list[EvalResult]) -> None:
         for result in results:
-            ray.get(aggregator.add_result.remote(result))
+            self._write_refs.append(aggregator.add_result.remote(result))
     
     def _handle_success(
         self, 

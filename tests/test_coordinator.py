@@ -348,15 +348,14 @@ class TestHandleTimeouts:
         pending = deque()
         submitted = []
 
-        with patch.object(coord_mod.ray, "get", lambda r, timeout=None: r):
-            coord._handle_timeouts(
-                active=active,
-                ref_timeouts=ref_timeouts,
-                workers=[_FakeWorker()],
-                pending=pending,
-                submit=lambda widx, b, retry_count=0: submitted.append(b),
-                aggregator=agg,
-            )
+        coord._handle_timeouts(
+            active=active,
+            ref_timeouts=ref_timeouts,
+            workers=[_FakeWorker()],
+            pending=pending,
+            submit=lambda widx, b, retry_count=0: submitted.append(b),
+            aggregator=agg,
+        )
 
         assert ref not in active
         assert submitted == [], (
