@@ -14,6 +14,17 @@ from coordinator import (
     validate_backend,
 )
 
+	
+class TestConstants:
+    def test_hung_threshold_floor(self):
+        """Threshold must be large enough that a healthy-but-slow batch isn't
+        evicted."""
+        assert HUNG_REF_THRESHOLD_S >= 30.0, (
+            f"HUNG_REF_THRESHOLD_S must be >= 30.0s, got "
+            f"{HUNG_REF_THRESHOLD_S}. Lower values risk evicting "
+            "healthy-but-slow workers."
+        )
+
 # Helpers
 def make_task(task_id: str = "t001") -> EvalTask:
     return EvalTask(
@@ -84,6 +95,12 @@ class TestClassifyFailure:
     def test_timeout_is_transient(self):
         assert classify_failure(TimeoutError("30s exceeded")) == FailureKind.TRANSIENT
 
+    def test_worker_batch_timeout_is_transient(self):
+        """The worker's per-batch TimeoutError (no longer a poisoning RuntimeError)"""
+        assert classify_failure(
+            TimeoutError("Worker 3: batch of 4 exceeded 60.0s")
+        ) == FailureKind.TRANSIENT
+
     def test_token_length_is_deterministic(self):
         assert classify_failure(
             RuntimeError("token indices sequence length longer than 512")
@@ -121,12 +138,6 @@ class TestBackoffSeconds:
         rng = random.Random(0)
         for retry_count in range(20):
             assert backoff_seconds(retry_count, rng) >= 0
-    
-    def test_worker_batch_timeout_is_transient(self):
-        """The worker's per-batch TimeoutError (no longer a poisoning RuntimeError)"""
-        assert classify_failure(
-            TimeoutError("Worker 3: batch of 4 exceeded 60.0s")
-        ) == FailureKind.TRANSIENT
 
 # Per-backend default batch size
 class TestDefaultBatchSize:

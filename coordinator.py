@@ -45,7 +45,7 @@ def validate_backend(worker: object) -> None:
         )
 
 def classify_failure(exc: Exception) -> FailureKind:
-    """TRANSIENT = retry; DETERMINISTIC = error will reccur, don't bother."""
+    """TRANSIENT = retry; DETERMINISTIC = error will recur, don't bother."""
     msg = str(exc).lower()
     for pattern in _DETERMINISTIC_PATTERNS:
         if pattern in msg:

@@ -1,6 +1,16 @@
 # Distributed LLM Eval Harness
 
-Ray-based eval harness for LLMs. Schedules batches of completion tasks across a pool of persistent worker actors with a work-stealing coordinator, scores responses against a weighted rubric, and streams results to JSONL through a single aggregator actor.
+Ray-based eval harness for LLMs with mid-generation hooks. Built to explore the infra problems that come up in agentic evals: scheduling inference across heterogeneous workers, recovering from hung or crashed processes, and exposing a clean per-token hook point for interventions on `AsyncLLMEngine`.
+
+## What it does
+
+- Schedules batches across a pool of Ray actors using a work-stealing coordinator. Retries transient failures with exponential backoff, replaces workers that hang or crash (force-killing the old actor so its GPUs are actually freed), enforces the retry budget on hangs as well as exceptions, and isn't blocked by the deferred retry queue.
+- Two interchangeable backends behind an `EvalBackend` Protocol: a CPU/GPU HuggingFace pipeline and a GPU vLLM backend on `AsyncLLMEngine`.
+- A streaming intervention API (`evaluate_with_hooks`) with per-token callbacks. The HF backend uses `StoppingCriteria` so hooks run synchronously inside `generate()` and can actually halt the model. The vLLM backend uses `AsyncLLMEngine` so hooks observe the engine's continuous-batching scheduler in real time and abort with `engine.abort(request_id)`. Hook-observed state (e.g. which trigger fired) returns to the caller via `EvalResult.hook_state`.
+- Deterministic fault injection coordinated through a shared actor, so the same `--seed` reproduces the same failure pattern across runs regardless of how Ray scheduled work.
+- A rubric scorer with named, weighted conditions and per-condition aggregation.
+- An aggregator actor that serializes concurrent writes from many workers into one JSONL stream without explicit locking.
+- Unit tests for the pure modules and integration tests for the coordinator using an in-memory fake backend, so tests don't need GPUs or model loads.
 
 ## Architecture
 
@@ -13,7 +23,7 @@ Ray-based eval harness for LLMs. Schedules batches of completion tasks across a 
               +---------------------+--------------------+
               |                     |                    |
         +-----v-----+         +-----v-----+        +-----v-----+
-        | HFWorker  |         |VLLMWorker |        | HFWorker  |
+        |EvalWorker |         |EvalWorker |        |EvalWorker |
         |  (actor)  |         |  (actor)  |        |  (actor)  |
         +-----+-----+         +-----+-----+        +-----+-----+
               |                     |                    |
@@ -25,7 +35,65 @@ Ray-based eval harness for LLMs. Schedules batches of completion tasks across a 
                         +------------------------+
 ```
 
-The coordinator never touches worker state directly. All communication goes through Ray's actor mailbox, which serializes calls per-actor.
+Worker pools are homogeneous - all HF or all vLLM per run, selected by `--backend` (mixed pools are not built). The coordinator never touches worker state directly. All communication goes through Ray's actor mailbox, which serializes calls per-actor.
+
+## Bugs found and fixed
+
+Bugs found while hardening the harness. Each fix has a regression test; the pattern is the same one the Testing section describes: find, explain the mechanism, pin it with a test.
+
+1. **Old actors were never killed on replacement.** `_replace_worker` dropped the handle and constructed a replacement - but a hung or poisoned GPU-claiming actor still holds its `num_gpus` claim, so the replacement can never schedule: every attempt times out at the 120s health barrier and the slot dies even though the GPU was one kill away from free. The GPU fault-tolerance benchmark below couldn't catch this because injected failures raise *without* poisoning, so replacement-under-GPU-contention was never exercised on GPU. Fix: force-`ray.kill(old, no_restart=True)` before constructing the replacement (this also errors out any evicted in-flight ref). Test: `test_replace_worker_kills_old_actor`.
+2. **Hangs incremented the retry budget but never enforced it.** The hang-eviction path re-queued with `retry_count + 1`, but only the exception path *checked* the budget - a batch that deterministically wedged the engine looped forever at one 240s eviction cycle per lap. Fix: `_handle_timeouts` enforces `max_retries` and records terminal failures on exhaustion. Test: `test_hang_budget_exhaustion_records_terminal_failures`.
+3. **The hooked demo read hook state that was never mutated.** Ray pickles hook objects into the actor; mutations happen on the worker's copies, so the driver's `stop_hook.triggered_by` stayed `None` and the "Triggered by" line could never print. Fix: hook-observable state returns via `EvalResult.hook_state`; the demo (and any caller) reads it there. Tests: `TestHookStateReturnPath`.
+4. **Hang detection only ran when the cluster was quiet.** The timeout scan was gated on `ray.wait` returning nothing - under steady completions from healthy workers it was starved exactly when the system was busiest, so a hung ref could linger far past the 240s threshold. Fix: the scan runs every loop iteration (it's O(active) dict reads).
+5. **Timeout -> poison -> full model reload was disproportionate.** When the HF `StoppingCriteria` deadline fires, the pipeline call returns cleanly - the loaded model is intact - yet the worker marked itself permanently poisoned, costing a model reload per slow batch. Fix: a batch timeout raises `TimeoutError` without poisoning; replacement happens only when a health check actually fails.
+6. **`--hf-device 0 --workers N` silently stacked N unaccounted replicas on one GPU.** Fix: the coordinator claims `num_gpus = 1/N` per HF worker on GPU (with the standard caveat that Ray fractions are scheduling accounting, not memory isolation) and logs a warning.
+7. Smaller items: aggregator writes are now fire-and-forget with an end-of-run drain (a blocking `ray.get` per batch stalled the single-threaded scheduler); the aggregator holds its file open instead of reopening per write; the p99 index used `int(0.99n)`, which is the max (p100) at n=100 - now nearest-rank; `mentions_topic` no longer awards near-free credit via stopwords like "The" (word-boundary matching on content words); the standard rubric now has one source of truth in `scoring.DEFAULT_CONDITIONS`; a module-level test assert became a real test.
+
+## Design notes
+
+A few choices that aren't obvious from reading the code:
+
+**Backend Protocol with a runtime hasattr check.** Ray actor handles are remote references, not the actor itself, so `isinstance(handle, EvalBackend)` returns False even when the actor implements the Protocol. The Protocol exists for documentation and unit-test fakes; `validate_backend` does an attribute check at startup so a missing method fails before the first batch.
+
+**Hung detection is per-ref, not per-worker.** A worker can issue many refs over its lifetime. Tracking timeouts per worker means a slow batch looks like a dead worker, which evicts workers that are actually fine. Per-ref means a healthy worker that finishes one batch and starts another resets cleanly.
+
+**Health check on every failure path.** When a batch fails, the coordinator health-checks the worker before deciding to retry. Without this, a poisoned worker keeps accepting batches that fail instantly, and the retry budget gets burned. The integration test `test_poisoned_worker_replaced_on_first_failure` covers this.
+
+**Two timeout layers, one budget.** The worker enforces a per-batch timeout via `StoppingCriteria` (HF) or `asyncio.wait_for` (vLLM) and raises on overrun. The coordinator enforces a separate per-ref hang threshold for the case where the actor itself becomes unreachable (process death, GC stall, network). Different failure modes, different thresholds - and both paths now consume and enforce the same retry budget.
+
+**Per-backend batch sizes.** vLLM's continuous batching only saturates with many concurrent in-flight requests, so the coordinator hands `VLLMWorker` 64 tasks per call by default. HF runs forward-pass-bound, so 4 is plenty there. This single change is the difference between the harness bottlenecking the engine at 6 tasks/s and the engine running freely at ~120; see Performance below.
+
+**Tuples in `pending`.** Retries re-append to `pending`, and a re-queued batch needs to remember how many times it's been tried. Keeping the count in the tuple means the budget is enforced on every retry path, including hangs.
+
+**Aggregator as an actor, writes as fire-and-forget.** Many workers writing one JSONL file becomes "many workers calling `add_result.remote(...)` on one actor." Ray serializes actor methods for free - no `fcntl`, no threading lock. The coordinator doesn't block on each write: actor tasks from one caller execute in submission order, so the end-of-run `get_summary` is guaranteed to see every write; the write refs are drained at the end so exceptions still surface.
+
+**Shared `FailureDecider` actor for deterministic injection.** The naive design - each worker holds its own seeded RNG - gives reproducible *per-worker* sequences but not reproducible *task-level* failures, because Ray's scheduler routes batches non-deterministically. A single decider actor that all fault-injecting workers query makes failure a function of `(seed, batch_content, attempt_number)` rather than which worker happened to receive the batch.
+
+**`AsyncLLMEngine` for hooks.** Synchronous `LLM.generate` returns when all prompts are done with no per-token callback, and there can't be one without breaking continuous batching. `AsyncLLMEngine.generate` returns an async iterator of `RequestOutput`s, one per scheduling step, so hooks can observe one specific request while the engine batches others. `engine.abort(request_id)` is the clean way to stop a single in-flight request. This targets the API surface of the pinned vLLM version; the V1 engine's maintained class is `AsyncLLM`, and both the import path and the cumulative-output assumption behind the delta diffing should be re-verified on any vLLM upgrade.
+
+## Layout
+
+```
+.
+├── README.md
+├── requirements.txt
+├── main.py                      # CLI entry point
+├── coordinator.py               # work-stealing scheduler, retry, hang detection
+├── worker.py                    # HFWorker and VLLMWorker actors
+├── fault_injection.py           # FailureDecider + fault-injecting worker subclasses
+├── aggregator.py                # ResultsAggregator actor (JSONL + stats)
+├── scoring.py                   # rubric scorer + condition checkers
+├── hooks.py                     # LoggingHook, EarlyStoppingHook
+├── types_.py                    # dataclasses, enums, Protocols
+├── utils.py                     # pure helpers (make_batches)
+├── results/                     # JSONL output
+└── tests/
+    ├── test_coordinator.py      # helpers + end-to-end against a fake backend
+    ├── test_fault_injection.py  # determinism, FailureDecider, seeding
+    ├── test_scoring.py
+    ├── test_hooks.py
+    └── test_utils.py
+```
 
 ## Running it
 
@@ -65,7 +133,7 @@ python main.py --tasks 200 --workers 1 --backend vllm \
 
 ## Performance
 
-Cloud GPU. Lambda A10 (24GB VRAM), `Qwen/Qwen2.5-1.5B`, vLLM backend, 1 worker, 1000 tasks per row, greedy decoding, max_new_tokens=80.
+Cloud GPU. Lambda A10 (24GB VRAM), `Qwen/Qwen2.5-1.5B`, vLLM backend, 1 worker, 1000 tasks per row, greedy decoding, max_new_tokens=80. Numbers were measured on the pre-review code; none of the review fixes sit on the vLLM batch hot path (the write path became less blocking, if anything), but re-run before quoting them as current.
 
 | `--batch-size` | Throughput (tasks/s) | Engine calls |
 | -------------: | -------------------: | -----------: |
@@ -84,7 +152,7 @@ From 128 to 256 the sweep gains ~2.5% (117.1 → 120.1 tasks/s) for real memory:
 
 The batch-4 row is the control: 5.91 tasks/s on the old harness vs 6.0 on this one, same hardware - the harness reproduces the old behavior when forced to the old batch size, so the climb up the table reflects a real change in how the harness drives the engine, not different hardware or a different model.
 
-**Laptop CPU baseline.** Lenovo IdeaPad 82FE, Intel Core i5-1135G7, `distilgpt2`, HF backend, 4 workers, 50 tasks. Included for the smoke-test fault tolerance comparison, not for absolute throughput. `distilgpt2` scores poorly on the trivia rubric because it's an 82M-parameter model trained mostly on web text; that's the model, not the harness.
+**Laptop CPU baseline.** Lenovo IdeaPad 82FE, Intel Core i5-1135G7, `distilgpt2`, HF backend, 4 workers, 50 tasks. Included for the smoke-test fault tolerance comparison, not for absolute throughput. `distilgpt2` scores poorly on the trivia rubric because it's an 82M-parameter model trained mostly on web text; that's the model, not the harness. (Note: the review tightened `mentions_topic`, so per-condition pass rates from older runs are not comparable to current ones.)
 
 | Scenario (50 tasks, 4 workers)      | Outcome                        |
 | ----------------------------------- | ------------------------------ |
@@ -99,7 +167,7 @@ Both backends use greedy decoding (`temperature=0.0` on vLLM; the HF text-genera
 
 Failure injection goes through a single shared `FailureDecider` actor that all fault-injecting workers query. The decider tracks per-batch attempt counts globally, so a decision is a function of `(seed, batch_content, attempt_number)` and not of which worker happened to receive the batch.
 
-Verified on GPU: 200 tasks, 13 batches at batch_size=16, `--failure-rate 0.3 --seed 42`. Two independent runs on a fresh actor pool produced identical outcomes:
+Verified on GPU (pre-review code): 200 tasks, 13 batches at batch_size=16, `--failure-rate 0.3 --seed 42`. Two independent runs on a fresh actor pool produced identical outcomes:
 
 |                                 | seed 42, run 1 | seed 42, run 2 | seed 99 |
 | ------------------------------- | -------------: | -------------: | ------: |
@@ -118,4 +186,23 @@ The companion test `tests/test_fault_injection.py` covers the determinism guaran
 pytest tests/
 ```
 
-The `scoring` and `utils` tests are pure Python and finish in well under a second.
+The `scoring`, `hooks`, and `utils` tests are pure Python and finish in well under a second. The coordinator tests cover both helpers and the full `run()` loop end-to-end. The end-to-end tests stub `ray.wait`, `ray.get`, and `ray.kill` and use an in-memory fake backend that satisfies `EvalBackend` structurally, so they exercise the real scheduler logic without a Ray cluster, GPU, or model load.
+
+Real bugs surfaced by tests, in two waves. From the original development:
+
+1. A deferred retry could promote back to `pending` after every active worker had gone idle, at which point nothing in the main loop dispatched the pending work and the run loop exited early. Fixed by including `pending` in the main loop condition and adding a dispatch-to-idle step after promotion.
+2. `_handle_failure` only health-checked the worker on the terminal-failure branch. While retries remained, a poisoned worker kept receiving submissions that failed immediately, burning the retry budget. Fixed by running the health check on every failure path, before the retry decision.
+3. The first attempt at deterministic fault injection seeded a per-worker RNG with `(seed, worker_id)`. This gave reproducible *per-worker* sequences but not reproducible *task-level* failures, because the scheduler routes batches non-deterministically. Replaced with the `FailureDecider` actor pattern; the regression test seeds via SHA-256 hashing of `(seed, batch_repr)` and verifies cross-run equivalence.
+
+And the items in **Bugs found and fixed** above - most notably the unkilled-actor GPU leak and the unenforced hang budget, both of which lived in code paths the happy-path benchmarks never exercised. All have regression tests against the fake-backend integration harness or the unit suites.
+
+## Known limitations
+
+These are real and worth knowing about; none are showstoppers.
+
+- **Whole-batch retry on partial failure.** When one task in a batch fails, the entire batch is re-queued. At vLLM batch sizes (64+), this re-runs many successful generations to recover one failure. Per-task retry, or splitting a failed batch in half on retry, would be the natural improvements.
+- **The single aggregator actor caps throughput at thousands of QPS.** Sharded aggregators keyed by `task_id % N` would scale linearly but aren't implemented. The same shape applies to the `FailureDecider`, which is also a single actor by design (with an unbounded per-batch attempt map) and would need sharding and eviction for multi-thousand-worker injection.
+- **Worker replacement blocks the scheduling loop.** The old actor is now killed immediately and the slot marked dead first, but constructing the replacement still blocks on model load - minutes at 70B scale - during which completed refs from healthy workers sit unharvested. A standby pool (workers pre-loaded and idle) or backgrounded replacement would make it O(1); neither is built.
+- **`tokens_generated` is left at 0 on the HF batch path.** Reported accurately on the hooked path (counted from criterion calls) and on vLLM batch (from `len(token_ids)`). Re-tokenizing the response string round-trips through BPE merges and isn't guaranteed to match the generated count, so the field stays unset rather than reporting a wrong number. Plumbing token IDs out of the HF pipeline is the proper fix.
+- **`tensor_parallel_size > 1` is wired through but only verified at `tp=1`.** The coordinator passes `tp` to both initial creation and worker replacement, the actor's `@ray.remote(num_gpus=tp)` claim follows from it, but a real multi-GPU run also wants `STRICT_PACK` placement groups for colocation; that piece isn't built. Single-GPU and CPU paths are exercised end-to-end on real hardware; multi-GPU and multi-node are designed-in but not run in anger.
+- **Failed-batch results are only written to JSONL at terminal outcome.** Hang exhaustion and all-workers-dead are now recorded, but a run that aborts mid-retry (e.g. SIGKILL) still leaves no record of in-flight batches. Writing on first failure with a `pending_retry` flag and updating on terminal outcome would close the gap.

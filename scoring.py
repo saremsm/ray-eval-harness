@@ -6,7 +6,7 @@ from typing import Callable
 
 from types_ import EvalTask, ScoringCondition
 
-# Negation Dectection
+# Negation Detection
 _NEGATION_WORDS = {
     # Negators
     "not", "never", "no",
@@ -18,11 +18,18 @@ _NEGATION_WORDS = {
     "don't", "doesn't", "didn't",
     # The Have's
     "hasn't", "haven't", "hadn't",
-    # Correcness
+    # Correctness
     "wrong", "incorrect", "false",
 }
 _NEGATION_WINDOW  = 6 #can catch "doesn't think the answer is X", but not unrelated 'not'. 
 _PUNCT_STRIP = string.punctuation
+
+# stopwords excluded from topic matching. without.
+_STOPWORDS = {
+    "the", "a", "an", "of", "is", "are", "was", "were", "in", "on", "at",
+    "to", "and", "or", "it", "its", "as", "by", "for", "with", "has",
+    "have", "had", "be", "been", "this", "that",
+}
 
 def _is_negated(response: str, match_start: int) -> bool:
     """negation within _NEGATION_WINDOW words before match_start. punctuation
@@ -73,11 +80,18 @@ def is_concise(response: str, task: EvalTask) -> bool:
     return len(response.split()) < 150
 
 def mentions_topic(response: str, task: EvalTask) -> bool:
-    """any of 5 longest prompt keywords in response"""
+    """any of the 5 longest content keywords present in the response (word-boundary
+    match; stopwords and short words excluded)."""
     words = [w.strip(_PUNCT_STRIP).lower() for w in task.prompt.split()]
-    keywords = sorted(set(w for w in words if w), key=len, reverse=True)[:5]
-    response_lower = response.lower()
-    return any(w in response_lower for w in keywords)
+    content = [w for w in words if len(w) >= 3 and w not in _STOPWORDS]
+    if not content:
+        # Degenerate all-stopword prompt: fall back to the raw words.
+        content = [w for w in words if w]
+    keywords = sorted(set(content), key=len, reverse=True)[:5]
+    return any(
+        re.search(rf"\b{re.escape(w)}\b", response, re.IGNORECASE)
+        for w in keywords
+    )
 
 # Default Rubric
 DEFAULT_CONDITIONS: list[ScoringCondition] = [

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from pathlib import Path
 
@@ -16,7 +17,8 @@ def _percentile(sorted_values: list[float], q: float) -> float:
     """nearest-rank percentile: ceil(q*n)-1; int(q*n) indexes the max (p100) at n=100."""
     if not sorted_values:
         return 0.0
-    idx = min(len(sorted_values) - 1, int(q * len(sorted_values)))
+    n = len(sorted_values)
+    idx = min(n - 1, max(0, math.ceil(q * n) - 1))
     return sorted_values[idx]
 
 @ray.remote
@@ -30,6 +32,7 @@ class ResultsAggregator:
         self.total_tasks = total_tasks
         self.output_path = Path(output_path)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.output_path.open("a", encoding="utf-8")
         self.start_time = time.perf_counter()
 
         self._count = 0

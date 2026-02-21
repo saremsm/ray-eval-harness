@@ -9,7 +9,8 @@ import ray
 
 from coordinator import DistributedEvalCoordinator
 from hooks import EarlyStoppingHook, LoggingHook
-from types_ import EvalTask, ScoringCondition
+from scoring import DEFAULT_CONDITIONS
+from types_ import EvalTask
 from worker import HFWorker
 
 logging.basicConfig(
@@ -43,32 +44,8 @@ _COMPLETIONS = [
     ("The tallest mountain is", "Everest"),
 ]
 
-# Standard Rubric for tasks:
-_CONDITIONS: list[ScoringCondition] = [
-    ScoringCondition(
-        name="contains_answer", 
-        weight=0.5,
-        description="Response contains expected answer",
-    ),
-    ScoringCondition(
-        name="answer_at_end",
-        weight=0.2,
-        description="Answer appears near the end of the response",
-    ),
-    ScoringCondition(
-        name="is_concise", 
-        weight=0.2,
-        description="Response is not excessively long",
-    ),
-    ScoringCondition(
-        name="mentions_topic",
-        weight=0.1,
-        description="Response mentions a keyword from the prompt",
-    ),
-]
-
 def make_tasks(n: int) -> list[EvalTask]:
-    """Generates n completion tasks, cycling through templates if n>20."""
+    """Generate n completion tasks, cycling through templates if n > 20."""
     n_templates = len(_COMPLETIONS)
     tasks = []
     for i in range(n):
@@ -83,7 +60,7 @@ def make_tasks(n: int) -> list[EvalTask]:
                 task_id=task_id, 
                 prompt=prompt,
                 expected_answer=answer, 
-                conditions=list(_CONDITIONS),
+                conditions=list(DEFAULT_CONDITIONS),
                 metadata={"prompt": prompt, "expected": answer, "cycle": cycle},
             )
         )
@@ -154,7 +131,7 @@ def print_summary(summary: dict, wall_elapsed: float) -> None:
     condition_stats = summary.get("condition_stats", {})
     if condition_stats:
         print(f"\n  Per-condition breakdown")
-        print(f"  {'Condition':<30} {'Pass rate':>9} {'Mean awarded':>12}")
+        print(f"  {'Condition':<30} {'Pass rate':>9}  {'Mean awarded':>12}")
         print(f"  {'-' * 56}")
         for cond, stats in sorted(
             condition_stats.items(),
@@ -168,7 +145,7 @@ def print_summary(summary: dict, wall_elapsed: float) -> None:
                 f"  {cond:<30} {bar} {pass_rate:>5.1%}  {mean_aw:>8.3f}"
             )
         print(
-            f"\n Pass rate = fraction of tasks where condition passed.\n"
+            f"\n  Pass rate = fraction of tasks where condition passed.\n"
             f"  Mean awarded = mean weight given (depends on condition weight).\n"
             f"  Sorted ascending: worst-performing conditions appear first."
         )
@@ -177,7 +154,7 @@ def print_summary(summary: dict, wall_elapsed: float) -> None:
     if worker_stats:
         print(f"\n  Per-worker stats:")
         print(
-            f"  {'Worker':<8} {'Completed': >10} {'Failed':>8} {'Poisoned':>10}"
+            f"  {'Worker':<8} {'Completed':>10} {'Failed':>8} {'Poisoned':>10}"
         )
         print(f"  {'-' * 40}")
         for ws in sorted(worker_stats, key=lambda x: x["worker_id"]):
@@ -200,7 +177,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--workers", type=int, default=3,
-        help="Number of parallel Evalworker actors (default: 3)",
+        help="Number of parallel EvalWorker actors (default: 3)",
     )
     parser.add_argument(
         "--failure-rate", type=float, default=0.0, dest="failure_rate",
@@ -332,7 +309,7 @@ def run_hooked_demo(model_name: str, hf_device: int) -> None:
         task_id="hook_demo",
         prompt="The capital of France is",
         expected_answer="Paris",
-        conditions=list(_CONDITIONS),
+        conditions=list(DEFAULT_CONDITIONS),
     )
 
     stop_hook = EarlyStoppingHook(triggers=["Paris", "paris"])

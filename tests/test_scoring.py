@@ -107,6 +107,21 @@ class TestMentionsTopic:
     def test_completely_off_topic(self, text_task):
         assert not mentions_topic("I like pizza very much", text_task)
 
+    def test_stopword_does_not_award_credit(self, text_task):
+        """Regression: 'The' from the prompt previously substring-matched inside
+        almost any English text ('the weather'), making the condition near-free."""
+        assert not mentions_topic(
+            "the weather there is otherwise nice", text_task
+        ), "A response containing only stopwords must not pass"
+        
+    def test_word_boundary_matching(self, text_task):
+        """'France' must not match inside an unrelated longer token."""
+        assert not mentions_topic("francesca went home", text_task)
+    def test_degenerate_all_stopword_prompt_falls_back(self):
+        task = EvalTask(task_id="t", prompt="is it a the", expected_answer=None)
+        # Falls back to raw words rather than auto-failing everything.
+        assert mentions_topic("is it though", task)
+
 
 class TestRubricScorer:
     def test_score_in_range(self, text_task):
