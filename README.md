@@ -59,7 +59,20 @@ A few choices that aren't obvious from reading the code:
 
 **Health check on every failure path.** When a batch fails, the coordinator health-checks the worker before deciding to retry. Without this, a poisoned worker keeps accepting batches that fail instantly, and the retry budget gets burned. The integration test `test_poisoned_worker_replaced_on_first_failure` covers this.
 
-**Two timeout layers, one budget.** The worker enforces a per-batch timeout via `StoppingCriteria` (HF) or `asyncio.wait_for` (vLLM) and raises on overrun. The coordinator enforces a separate per-ref hang threshold for the case where the actor itself becomes unreachable (process death, GC stall, network). Different failure modes, different thresholds - and both paths now consume and enforce the same retry budget.
+**Two timeout layers, one budget.** The worker enforces a per-batch timeout via `StoppingCriteria` (HF) or `asyncio.wait_for` (vLLM) and raises on overrun. The coordinator enforces a separate per-ref hang threshold for the case where the actor itself becomes unreachable (process death, GC stall, network). The worker-side timeout always fires first on a live worker; the coordinator threshold only exists to catch workers whose own timeout machinery is dead, so it is derived from `--task-timeout` rather than fixed (a fixed 240s evicted healthy workers whenever `--task-timeout` exceeded it):
+
+```
+hang_threshold_s = max(HANG_THRESHOLD_MIN_S,
+                       HANG_MULTIPLIER * task_timeout + HANG_MARGIN_S)
+```
+
+| Constant              | Value | Why                                                                 |
+| --------------------- | ----: | ------------------------------------------------------------------- |
+| `HANG_THRESHOLD_MIN_S`|   120 | Floor: tiny `--task-timeout` values must not make eviction trigger-happy - eviction costs a blocking model reload. |
+| `HANG_MULTIPLIER`     |     2 | A batch may run its full budget and spend nearly as long again raising/serializing; 2x keeps a live worker's slowest legal batch inside the threshold. |
+| `HANG_MARGIN_S`       |    30 | Actor-mailbox and scheduling latency, which does not shrink with small timeouts. |
+
+The derived value is logged at startup and reported in the summary as `hang_threshold_s`. Different failure modes, different thresholds - and both paths consume and enforce the same retry budget.
 
 **Per-backend batch sizes.** vLLM's continuous batching only saturates with many concurrent in-flight requests, so the coordinator hands `VLLMWorker` 64 tasks per call by default. HF runs forward-pass-bound, so 4 is plenty there. This single change is the difference between the harness bottlenecking the engine at 6 tasks/s and the engine running freely at ~120; see Performance below.
 

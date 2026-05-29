@@ -8,22 +8,45 @@ import coordinator as coord_mod
 from types_ import EvalResult, EvalTask, FailureKind
 from coordinator import (
     DistributedEvalCoordinator,
-    HUNG_REF_THRESHOLD_S,
+    HANG_MARGIN_S,
+    HANG_MULTIPLIER,
+    HANG_THRESHOLD_MIN_S,
     classify_failure,
     backoff_seconds,
     validate_backend,
 )
 
-	
-class TestConstants:
-    def test_hung_threshold_floor(self):
-        """Threshold must be large enough that a healthy-but-slow batch isn't
-        evicted."""
-        assert HUNG_REF_THRESHOLD_S >= 30.0, (
-            f"HUNG_REF_THRESHOLD_S must be >= 30.0s, got "
-            f"{HUNG_REF_THRESHOLD_S}. Lower values risk evicting "
-            "healthy-but-slow workers."
+class TestHangThresholdDerivation:
+    """hang_threshold_s = max(MIN, MULTIPLIER * task_timeout + MARGIN)."""
+
+    def _derived(self, task_timeout: float) -> float:
+        return max(
+            HANG_THRESHOLD_MIN_S,
+            HANG_MULTIPLIER * task_timeout + HANG_MARGIN_S,
         )
+
+    def test_default_timeout(self):
+        # 60s default: 2 * 60 + 30 = 150, above the 120 floor.
+        coord = make_coordinator(task_timeout=60.0)
+        assert coord.hang_threshold_s == self._derived(60.0) == 150.0
+
+    def test_large_timeout_scales_above_old_fixed_value(self):
+        # --task-timeout 300 previously evicted healthy workers at the fixed 240s.
+        coord = make_coordinator(task_timeout=300.0)
+        assert coord.hang_threshold_s == self._derived(300.0) == 630.0
+        assert coord.hang_threshold_s > 300.0, (
+            "Coordinator threshold must exceed the worker-side timeout, "
+            "or it evicts workers whose batches are still legally running."
+        )
+
+    def test_small_timeout_hits_floor(self):
+        # 2 * 10 + 30 = 50 would be trigger-happy; the floor wins.
+        coord = make_coordinator(task_timeout=10.0)
+        assert coord.hang_threshold_s == self._derived(10.0) == HANG_THRESHOLD_MIN_S
+
+    def test_floor_is_sane(self):
+        """Floor must be large enough that a healthy-but-slow batch isn't evicted."""
+        assert HANG_THRESHOLD_MIN_S >= 30.0
 
 # Helpers
 def make_task(task_id: str = "t001") -> EvalTask:
@@ -231,7 +254,7 @@ class TestHandleTimeouts:
         ref = _Ref("r0")
         batch = [make_task("t0")]
         active = {ref: (0, batch, 0)}
-        ref_timeouts = {ref: time.monotonic() - HUNG_REF_THRESHOLD_S - 1.0}
+        ref_timeouts = {ref: time.monotonic() - coord.hang_threshold_s - 1.0}
 
         agg = _CapturingAggregator()
 
@@ -255,7 +278,7 @@ class TestHandleTimeouts:
         ref = _Ref("r0")
         batch = [make_task("t0")]
         active = {ref: (0, batch, 0)}
-        ref_timeouts = {ref: time.monotonic() - HUNG_REF_THRESHOLD_S - 1.0}
+        ref_timeouts = {ref: time.monotonic() - coord.hang_threshold_s - 1.0}
         pending = deque()
         submitted = []
 
@@ -299,7 +322,7 @@ class TestHandleTimeouts:
             ref_young: (1, batch_young, 0),
         }
         ref_timeouts = {
-            ref_old: now - HUNG_REF_THRESHOLD_S - 1.0,
+            ref_old: now - coord.hang_threshold_s - 1.0,
             ref_young: now,
         }
 
@@ -345,6 +368,45 @@ class TestHandleTimeouts:
         assert submitted == []
         assert agg.results == []
 
+    def test_derived_threshold_evicts_below_old_fixed_240(self):
+        """With a small task_timeout, a ref older than the derived threshold but
+        younger than the old fixed 240s must trigger the hang path."""
+        coord = make_coordinator(max_retries=2, task_timeout=10.0)
+        coord._replace_worker = lambda workers, idx: None
+        assert coord.hang_threshold_s < 240.0  # 120s floor here
+
+        ref = _Ref("r0")
+        batch = [make_task("t0")]
+        active = {ref: (0, batch, 0)}
+        # Age: past the derived threshold, well under 240.
+        age = coord.hang_threshold_s + 10.0
+        assert age < 240.0
+        ref_timeouts = {ref: time.monotonic() - age}
+        pending = deque()
+        submitted = []
+
+        agg = _CapturingAggregator()
+        coord._handle_timeouts(
+            active=active,
+            ref_timeouts=ref_timeouts,
+            workers=[_FakeWorker()],
+            pending=pending,
+            submit=lambda widx, b, retry_count=0: submitted.append(
+                (b, retry_count)
+            ),
+            aggregator=agg,
+        )
+
+        assert ref not in active, (
+            "Ref past the derived threshold must be evicted even though "
+            "it is younger than the old fixed 240s"
+        )
+        assert ref not in ref_timeouts
+        # Exactly one terminal state for the batch: re-queued.
+        assert len(submitted) == 1
+        assert submitted[0][1] == 1, "hang must consume the retry budget"
+        assert agg.results == []
+
     def test_hang_budget_exhaustion_records_terminal_failures(self):
         """Hang past max_retries => recorded terminal failure, not re-queued.
         Regression: retry_count incremented on the hang path but never checked;
@@ -355,7 +417,7 @@ class TestHandleTimeouts:
         batch = [make_task("t0"), make_task("t1")]
         # retry_count == max_retries: the budget is spent.
         active = {ref: (0, batch, 2)}
-        ref_timeouts = {ref: time.monotonic() - HUNG_REF_THRESHOLD_S - 1.0}
+        ref_timeouts = {ref: time.monotonic() - coord.hang_threshold_s - 1.0}
         pending = deque()
         submitted = []
 
@@ -636,6 +698,18 @@ class TestCoordinatorIntegration:
         )
         assert summary["succeeded"] == 8
         assert summary["failed"] == 0
+
+    def test_summary_reports_hang_threshold(self, patched_ray):
+        """run() must surface the derived threshold so operators can see what
+        eviction policy the run actually used."""
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["ok"] * 4, ["ok"] * 4],
+            n_tasks=4,
+        )
+        summary = coord.run(tasks)
+        assert summary["hang_threshold_s"] == coord.hang_threshold_s
+        # _coordinator_with_fake_workers passes task_timeout=60.0.
+        assert summary["hang_threshold_s"] == 150.0
 
     def test_transient_failure_is_retried_and_succeeds(self, patched_ray):
         # Worker 0 fails on first call, then succeeds. Worker 1 is always healthy.

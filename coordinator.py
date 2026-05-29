@@ -18,14 +18,18 @@ logger = logging.getLogger(__name__)
 # Bounded wait for the whole pool to answer its first health check.
 WORKER_INIT_TIMEOUT_S = 120.0
 
-# Wall-clock threshold for treating an outstanding ref as hung.
-HUNG_REF_THRESHOLD_S = 240.0
+# hang threshold = max(MIN, MULTIPLIER * task_timeout + MARGIN): catches
+# workers whose own timeout machinery is dead.
+#   hang_threshold_s = max(HANG_THRESHOLD_MIN_S,
+#   HANG_MULTIPLIER * task_timeout_s + HANG_MARGIN_S)
+HANG_THRESHOLD_MIN_S = 120.0
+HANG_MULTIPLIER = 2.0
+HANG_MARGIN_S = 30.0
 
 # Poll interval when no refs are completing.
 RETRY_POLL_INTERVAL = 1.0
 
-# Per-backend batch-size defaults: HF over-batches past 4; vLLM's continuous
-# batching starves below 64.
+# Per-backend batch sizes: vLLM's continuous batching saturates only with
 DEFAULT_BATCH_SIZE_HF = 4
 DEFAULT_BATCH_SIZE_VLLM = 64
 
@@ -82,6 +86,17 @@ class DistributedEvalCoordinator:
         self.max_retries = max_retries
         # task_timeout is per-BATCH.
         self.task_timeout = task_timeout
+        # Derived, not fixed: a fixed 240s evicted healthy workers when --task-
+        self.hang_threshold_s = max(
+            HANG_THRESHOLD_MIN_S,
+            HANG_MULTIPLIER * task_timeout + HANG_MARGIN_S,
+        )
+        logger.info(
+            f"Hang threshold: {self.hang_threshold_s:.0f}s "
+            f"(max({HANG_THRESHOLD_MIN_S:.0f}, "
+            f"{HANG_MULTIPLIER:g} * task_timeout={task_timeout:g} "
+            f"+ {HANG_MARGIN_S:.0f}))"
+        )
         self.output_path = output_path
         self.tensor_parallel_size = tensor_parallel_size
         self.hf_device = hf_device
@@ -259,6 +274,7 @@ class DistributedEvalCoordinator:
         worker_stats = ray.get([w.get_stats.remote() for w in live_workers])
         summary = ray.get(aggregator.get_summary.remote())
         summary["worker_stats"] = worker_stats
+        summary["hang_threshold_s"] = self.hang_threshold_s
         return summary
 
     # Hung-worker handling
@@ -271,7 +287,7 @@ class DistributedEvalCoordinator:
         submit,
         aggregator: object,
     ) -> None:
-        """evict refs older than HUNG_REF_THRESHOLD_S, replace owning worker."""
+        """evict refs older than self.hang_threshold_s, replace owning worker."""
         now = time.monotonic()
         # Snapshot before iterating: active is mutated during eviction.
         for ref in list(active.keys()):
@@ -280,7 +296,7 @@ class DistributedEvalCoordinator:
 
             submitted_at = ref_timeouts.get(ref, now)
             age = now - submitted_at
-            if age < HUNG_REF_THRESHOLD_S:
+            if age < self.hang_threshold_s:
                 continue
 
             worker_idx, batch, retry_count = active.pop(ref)
@@ -288,7 +304,7 @@ class DistributedEvalCoordinator:
 
             logger.error(
                 f"Worker {worker_idx}: ref outstanding for {age:.0f}s "
-                f"(threshold {HUNG_REF_THRESHOLD_S:.0f}s); replacing worker"
+                f"(threshold {self.hang_threshold_s:.0f}s); replacing worker"
             )
 
             task_max_retries = (
@@ -318,7 +334,7 @@ class DistributedEvalCoordinator:
                         failed=True,
                         worker_id=worker_idx,
                         error=(
-                            f"batch hung >= {HUNG_REF_THRESHOLD_S:.0f}s "
+                            f"batch hung >= {self.hang_threshold_s:.0f}s "
                             f"{retry_count + 1} time(s); retry budget exhausted"
                         ),
                         failure_kind=FailureKind.TRANSIENT,
@@ -467,7 +483,6 @@ class DistributedEvalCoordinator:
             for i in range(self.n_workers)
         ]
         # Bounded init barrier: without a timeout.
-        WORKER_INIT_TIMEOUT_S = 120.0
         try:
             ray.get(
                 [w.health_check.remote() for w in workers],

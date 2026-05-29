@@ -17,7 +17,6 @@ HF_MICRO_BATCH_SIZE = 8
 # Per-batch wall-clock budget for one evaluate call (seconds). 
 DEFAULT_TASK_TIMEOUT = 60.0
 
-	
 def _collect_hook_state(hooks: list) -> dict:
     """gather hook-observable state to return via EvalResult.hook_state."""
     state: dict = {}
@@ -34,7 +33,6 @@ def _make_timeout_criterion(deadline: float):
 
     class _TimeoutCriterion(StoppingCriteria):
         def __init__(self):
-            """device: -1 CPU, 0+ CUDA."""
             super().__init__()
             self.deadline = deadline
             self.timed_out = False
@@ -102,7 +100,9 @@ class HFWorkerImpl:
         task_timeout: float = DEFAULT_TASK_TIMEOUT,
         device: int = -1,
     ) -> None:
-        """device: -1 for CPU, 0+ for CUDA devices."""
+        """device: -1 CPU, 0+ CUDA. GPU accounting is the coordinator's:
+        _worker_factory claims fractional num_gpus (device >= 0) so Ray doesn't
+        stack unaccounted replicas."""
         self.worker_id = worker_id
         self.model_name = model_name
         self.task_timeout = task_timeout

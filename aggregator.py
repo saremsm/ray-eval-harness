@@ -91,7 +91,7 @@ class ResultsAggregator:
         )
     
     def get_summary(self) -> dict:
-        """full summary shape, includng zero-result case."""
+        """full summary shape, including zero-result case."""
         elapsed = time.perf_counter() - self.start_time
         mean_score = (
             self._score_sum / self._succeeded if self._succeeded > 0 else 0.0
