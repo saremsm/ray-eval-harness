@@ -67,6 +67,17 @@ def make_tasks(n: int) -> list[EvalTask]:
     return tasks
 
 # Summary
+def _bar_chars() -> tuple[str, str]:
+    """Block characters for the pass-rate bar, with an ASCII fallback. Windows
+    consoles often default to cp1252, which can't encode U+2588/U+2591 and
+    crashes print() mid-summary."""
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        "█░".encode(encoding)
+        return "█", "░"
+    except (UnicodeEncodeError, LookupError):
+        return "#", "-"
+
 def _build_fault_injection(backend: str, failure_rate: float, seed: int):
     """Pick the fault-injecting worker class and create a shared"""
     if failure_rate <= 0.0:
@@ -133,6 +144,7 @@ def print_summary(summary: dict, wall_elapsed: float) -> None:
         print(f"\n  Per-condition breakdown")
         print(f"  {'Condition':<30} {'Pass rate':>9}  {'Mean awarded':>12}")
         print(f"  {'-' * 56}")
+        full_char, empty_char = _bar_chars()
         for cond, stats in sorted(
             condition_stats.items(),
             key=lambda x: x[1]["pass_rate"],
@@ -140,7 +152,7 @@ def print_summary(summary: dict, wall_elapsed: float) -> None:
             pass_rate = stats["pass_rate"]
             mean_aw = stats["mean_awarded"]
             bar_len = int(pass_rate * 20)
-            bar = "█" * bar_len + "░" * (20 - bar_len)
+            bar = full_char * bar_len + empty_char * (20 - bar_len)
             print(
                 f"  {cond:<30} {bar} {pass_rate:>5.1%}  {mean_aw:>8.3f}"
             )
