@@ -423,10 +423,19 @@ class DistributedEvalCoordinator:
                 workers[worker_idx].health_check.remote(),
                 timeout=5.0,
             )
-        except Exception:
+        except Exception as health_exc:
+            logger.warning(
+                f"Worker {worker_idx} (backend={self.backend}) health "
+                f"check unreachable ({health_exc!r}); replacing worker "
+                f"for health reasons"
+            )
             self._replace_worker(workers, worker_idx)
             return
         if not is_healthy:
+            logger.warning(
+                f"Worker {worker_idx} (backend={self.backend}) reported "
+                f"unhealthy; replacing worker for health reasons"
+            )
             self._replace_worker(workers, worker_idx)
 
     def _assign_next(

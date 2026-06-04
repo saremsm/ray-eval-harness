@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 
@@ -16,6 +17,40 @@ MAX_NEW_TOKENS = 80
 HF_MICRO_BATCH_SIZE = 8
 # Per-batch wall-clock budget for one evaluate call (seconds). 
 DEFAULT_TASK_TIMEOUT = 60.0
+
+# Budget for one engine check_health() round-trip inside.
+HEALTH_CHECK_TIMEOUT_S = 4.0
+
+# Exception class NAMES treated as engine-fatal on the vLLM worker.
+_ENGINE_FATAL_EXC_NAMES = frozenset({
+    "EngineDeadError",       # V1: vllm.v1.engine.exceptions
+    "EngineGenerateError",   # V1: vllm.v1.engine.exceptions
+    "AsyncEngineDeadError",  # V0: vllm.engine.async_llm_engine
+    "OutOfMemoryError",      # torch.cuda.OutOfMemoryError
+})
+
+# Message fingerprints of CUDA-level faults that leave the process's CUDA.
+_CUDA_ERROR_PATTERNS = (
+    "cuda error",
+    "cuda out of memory",
+    "device-side assert",
+    "illegal memory access",
+    "cublas",
+    "cudnn",
+    "nccl",
+)
+
+
+def _is_engine_fatal(exc: BaseException) -> bool:
+    """True if exc means the vLLM engine / CUDA context is not to be trusted for
+    further batches."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return False
+    for klass in type(exc).__mro__:
+        if klass.__name__ in _ENGINE_FATAL_EXC_NAMES:
+            return True
+    msg = str(exc).lower()
+    return any(pattern in msg for pattern in _CUDA_ERROR_PATTERNS)
 
 def _collect_hook_state(hooks: list) -> dict:
     """gather hook-observable state to return via EvalResult.hook_state."""
@@ -273,22 +308,42 @@ class VLLMWorkerImpl:
             f"(vLLM async, tp={tensor_parallel_size})..."
         )
 
-        from vllm import SamplingParams
+        # Set when the last evaluate_batch/evaluate_with_hooks raised a CUDA.
+        self._last_error: BaseException | None = None
+
+        self._engine = self._build_engine()
+        self._sampling_params = self._build_sampling_params()
+
+        logger.info(f"Worker {worker_id}: ready")
+
+    def _build_engine(self):
+        """Construct the async engine."""
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.engine.async_llm_engine import AsyncLLMEngine
 
         engine_args = AsyncEngineArgs(
-            model=model_name,
+            model=self.model_name,
             dtype="auto",
-            tensor_parallel_size=tensor_parallel_size,
+            tensor_parallel_size=self.tensor_parallel_size,
         )
-        self._engine = AsyncLLMEngine.from_engine_args(engine_args)
-        self._sampling_params = SamplingParams(
-            max_tokens=max_new_tokens,
+        return AsyncLLMEngine.from_engine_args(engine_args)
+
+    def _build_sampling_params(self):
+        from vllm import SamplingParams
+
+        return SamplingParams(
+            max_tokens=self.max_new_tokens,
             temperature=0.0,
         )
 
-        logger.info(f"Worker {worker_id}: ready")
+    def _note_batch_failure(self, exc: BaseException) -> None:
+        if _is_engine_fatal(exc):
+            self._last_error = exc
+            logger.error(
+                f"Worker {self.worker_id}: engine-fatal failure recorded; "
+                f"health_check will report unhealthy until a batch "
+                f"succeeds: {exc!r}"
+            )
 
     def _next_request_id(self) -> str:
         self._request_counter += 1
@@ -318,16 +373,18 @@ class VLLMWorkerImpl:
                 asyncio.gather(*[_run_one(t) for t in tasks]),
                 timeout=self.task_timeout,
             )
-        except Exception:
+        except Exception as exc:
             for rid in request_ids:
                 try:
                     await self._engine.abort(rid)
                 except Exception:
                     pass
             self.tasks_failed += len(tasks)
+            self._note_batch_failure(exc)
             raise
 
         batch_latency = time.perf_counter() - start
+        self._last_error = None  # engine proved itself; clear the flag
         estimated_per_task = batch_latency / len(tasks)
 
         results = []
@@ -377,15 +434,17 @@ class VLLMWorkerImpl:
                     await self._engine.abort(request_id)
                     break
 
-        except Exception:
+        except Exception as exc:
             self.tasks_failed += 1
             try:
                 await self._engine.abort(request_id)
             except Exception:
                 pass
+            self._note_batch_failure(exc)
             raise
 
         elapsed = time.perf_counter() - start
+        self._last_error = None  # engine proved itself; clear the flag
         score, condition_scores = self._scorer.score(accumulated, task)
         self.tasks_completed += 1
 
@@ -404,6 +463,41 @@ class VLLMWorkerImpl:
         )
 
     async def health_check(self) -> bool:
+        """Real health, not a constant True (which let a dead engine burn the whole
+        retry budget - the coordinator's poison path never fired for this
+        backend)."""
+        if self._last_error is not None:
+            return False
+
+        engine = self._engine
+        try:
+            if getattr(engine, "errored", False):
+                return False
+        except Exception:
+            # The property itself blew up: no reason to trust the engine.
+            return False
+
+        check = getattr(engine, "check_health", None)
+        if check is None:
+            return True
+        try:
+            if inspect.iscoroutinefunction(check):
+                await asyncio.wait_for(
+                    check(), timeout=HEALTH_CHECK_TIMEOUT_S
+                )
+            else:
+                # Sync check: run in a thread so a wedged engine can't hang the actor's event.
+                maybe = await asyncio.wait_for(
+                    asyncio.to_thread(check),
+                    timeout=HEALTH_CHECK_TIMEOUT_S,
+                )
+                if inspect.isawaitable(maybe):
+                    await asyncio.wait_for(
+                        maybe, timeout=HEALTH_CHECK_TIMEOUT_S
+                    )
+        except Exception:
+            # Raised, timed out, or returned garbage: all unhealthy.
+            return False
         return True
 
     async def get_stats(self) -> dict:
@@ -413,7 +507,11 @@ class VLLMWorkerImpl:
             "backend": "vllm",
             "completed": self.tasks_completed,
             "failed": self.tasks_failed,
-            "poisoned": False,
+            "poisoned": self._last_error is not None,
+            "last_error": (
+                repr(self._last_error)
+                if self._last_error is not None else None
+            ),
         }
 
 HFWorker = ray.remote(HFWorkerImpl)
