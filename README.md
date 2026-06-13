@@ -103,11 +103,21 @@ The derived value is logged at startup and reported in the summary as `hang_thre
 ├── scoring.py                   # rubric scorer + condition checkers
 ├── hooks.py                     # LoggingHook, EarlyStoppingHook
 ├── types_.py                    # dataclasses, enums, Protocols
+├── metrics.py                   # Metrics Protocol + NullMetrics (no-op default)
 ├── utils.py                     # pure helpers (make_batches)
 ├── results/                     # JSONL output
+├── bench/
+│   ├── fake_worker.py           # FakeLatencyWorker (sleeps instead of inferring)
+│   ├── recording.py             # RecordingMetrics + analysis helpers
+│   ├── saturation.py            # single-point saturation run
+│   ├── sweep_saturation.py      # latency x workers x batch grid
+│   ├── plot_saturation.py       # achieved-vs-offered curves + knee
+│   └── results/                 # bench JSON reports (gitignored)
 └── tests/
     ├── test_coordinator.py      # helpers + end-to-end against a fake backend
     ├── test_fault_injection.py  # determinism, FailureDecider, seeding
+    ├── test_metrics_null.py     # NullMetrics equivalence (saturation bench)
+    ├── test_bench.py            # bench harness (incl. @slow real-Ray run)
     ├── test_scoring.py
     ├── test_hooks.py
     └── test_utils.py
@@ -179,6 +189,106 @@ The batch-4 row is the control: 5.91 tasks/s on the old harness vs 6.0 on this o
 | One worker killed mid-run           | 50/50; run continues at n-1    |
 | Kill + `--failure-rate 0.3`         | 50/50; replacement + retries   |
 
+## Scaling benchmark
+
+`bench/` answers one question with numbers instead of intuition: **at what
+offered load does the coordinator itself saturate?** The coordinator is a
+single-threaded driver loop - `ray.wait`, dispatch, aggregator submits - and
+at some completion rate that loop, not the GPUs, becomes the ceiling.
+
+**Method.** `bench/saturation.py` drives the *real*
+`DistributedEvalCoordinator` and the *real* `ResultsAggregator` actor, but
+replaces model workers with `FakeLatencyWorker` async actors whose
+`evaluate_batch` just `asyncio.sleep`s for `latency_s * (1 + jitter*U(-1,1))`
+and returns well-formed results with tiny outputs. Offered load is then a
+free dial - `workers * batch_size / latency_s` tasks/s - with no GPUs
+involved, and `--fail-rate > 0` routes through the existing `FailureDecider`
+so the retry machinery is part of what gets measured. `bench/sweep_saturation.py`
+runs the grid (latency {0.5, 0.1, 0.02, 0.005}s x workers {16, 64, 128, 256}
+x batch {1, 8, 64}), skipping result files that already exist;
+`bench/plot_saturation.py` draws achieved-vs-offered per batch size and
+prints the knee: the first point where achieved < 0.8 x offered.
+
+```bash
+python -m bench.saturation --workers 128 --latency-s 0.02 --batch-size 8 \
+    --tasks 200000 --fail-rate 0.0 --out bench/results/sat_w128_l020_b8.json
+python -m bench.sweep_saturation --max-workers 128
+python -m bench.plot_saturation                 # curves + knees
+python -m bench.plot_saturation --compare before/ after/   # the shard sweep overlays
+```
+
+**Why completions/sec on the x-axis, not GPU count.** The coordinator never
+sees a GPU; it sees completion events. 8 fast workers finishing 64-task
+batches every 200ms present exactly the same coordination load as 256 slow
+workers finishing the same batches every 6.4s, and a GPU-count axis would put
+those at opposite ends of the plot while the loop experiences them
+identically. Completions/sec is the load variable the coordinator actually
+saturates on, it's what the fake workers let us dial without hardware, and it
+makes the result portable: multiply a planned deployment's GPU count by its
+per-GPU completion rate and read the headroom straight off the curve.
+
+**Worker count is a process count.** Every Ray actor is an OS process; a
+30-vCPU box hosts a few hundred (sleeping) actors at most before process
+overhead pollutes the measurement - hence `--max-workers`. To raise offered
+load past that cap, *lower the latency* rather than raising the worker
+count: offered load only depends on the ratio.
+
+**Instrumentation is measurement-only.** The coordinator carries a
+`_metrics` seam (`metrics.py`) defaulting to a no-op `NullMetrics`
+singleton; the bench swaps in `bench/recording.py`'s `RecordingMetrics`
+after construction. Timers cover `ray_wait` / `dispatch` / `agg_submit` /
+`loop_iter`; gauges sample `pending` / `active` / `deferred` / `standby`
+(the last reserved for the future standby pool, currently always 0); counts
+track `completed` / `failed` / `retried` / `replaced`.
+`tests/test_metrics_null.py` pins the equivalence: the null timer never
+suppresses exceptions, and the same fake-Ray scenario produces identical
+results with and without recording - on top of the whole pre-existing suite
+running against the instrumented coordinator with the null default.
+
+One caveat the report states explicitly: **Ray exposes no actor mailbox
+depth**, so aggregator backlog is measured as `add_result` call latency
+(submit-to-ready, sampled every Nth call from the coordinator side). The
+actor drains its mailbox FIFO, so call latency *is* queue depth expressed in
+seconds - a proxy, and labeled as one in the JSON.
+
+### Measured baseline (saturation bench)
+
+Environment: Vultr dedicated-CPU instance, 32 vCPU, Ubuntu 24.04, Python 3.12,
+ray 2.50.0. Full grid (latency x workers x batch), three independent sweeps.
+Raw run reports: `bench/results/published/`.
+
+| batch | ceiling (tasks/s, 3 reps)   | spread | knee (offered) |
+|-------|-----------------------------|--------|----------------|
+| 1     | 2,701 / 2,683 / 2,678       | 0.9%   | ~2,560/s       |
+| 8     | 4,911 / 4,842 / 4,906       | 1.4%   | ~4,096/s       |
+| 64    | 4,873 / 4,869 / 4,848       | 0.5%   | ~8,192/s       |
+
+The coordinator loop saturates at **~4,900 completions/s** for batch >= 8.
+Batch 1's lower ceiling (~2,700/s) shows the cost is per-*task*, not per-batch:
+batching 8 vs 64 barely moves the ceiling, batching 1 vs 8 nearly doubles it.
+
+**Bottleneck attribution (steady-state time share at saturation):**
+`agg_submit` consumes **89-90%** of the loop at the deepest saturation points,
+with `ray_wait` at 1-2% - the coordinator is not slow at scheduling, it is
+drowning in per-task `add_result` submissions. The mailbox-latency proxy
+confirms it: p50 ~2ms healthy, p99 **15-17 seconds** at saturation.
+
+**Fault-tolerance tax:** at 10% injected batch failures (same grid row,
+`--compare clean_row faulted`), peak throughput drops 4,911 -> 3,675 tasks/s
+(-25%), widening to **-52%** at 256 workers. Unaccounted loop time jumps from
+~2% to ~41% under faults - the blocking `ray.get(health_check)` poison probe
+in the failure path freezes the scheduling loop once per failure, so the cost
+grows with pool size.
+
+Both findings point at specific fixes (batched aggregator writes; non-blocking
+poison checks) - addressed in the overlay with before/after overlays from the same
+instance class.
+
+Scope note: this measures single-node coordinator/scheduler saturation -
+driver loop + aggregator actor on one box - not cluster-scale throughput.
+That is by design: the coordinator is the component that saturates first,
+and completions/sec makes the ceiling portable to any fleet size.
+
 ## Reproducibility
 
 Both backends use greedy decoding (`temperature=0.0` on vLLM; the HF text-generation pipeline defaults to `do_sample=False`). Outputs are **empirically stable across runs** (table below), but greedy decoding under continuous batching is not *guaranteed* bitwise-deterministic: batch composition changes kernel shapes and reduction orders, and composition varies with retry timing (backoff jitter deliberately uses an unseeded RNG). Failure *decisions* are fully deterministic; wall-clock scheduling is not.
@@ -201,7 +311,8 @@ The companion test `tests/test_fault_injection.py` covers the determinism guaran
 ## Testing
 
 ```bash
-pytest tests/
+pytest tests/            # fast suite (slow tests deselected by default)
+pytest tests/ -m slow    # real-Ray bench smoke test (~15s incl. cluster boot)
 ```
 
 The `scoring`, `hooks`, and `utils` tests are pure Python and finish in well under a second. The coordinator tests cover both helpers and the full `run()` loop end-to-end. The end-to-end tests stub `ray.wait`, `ray.get`, and `ray.kill` and use an in-memory fake backend that satisfies `EvalBackend` structurally, so they exercise the real scheduler logic without a Ray cluster, GPU, or model load.
