@@ -8,6 +8,7 @@ import ray
 import random
 
 from aggregator import ResultsAggregator
+from metrics import NULL_METRICS
 from types_ import EvalResult, EvalTask, FailureKind
 
 from utils import make_batches
@@ -107,6 +108,9 @@ class DistributedEvalCoordinator:
             )
         self.batch_size = batch_size
 
+        # Measurement-only instrumentation.
+        self._metrics = NULL_METRICS
+
         self._aggregator_cls = aggregator_cls
         self._write_refs: list = []
         self._worker_cls = worker_cls or (
@@ -192,80 +196,96 @@ class DistributedEvalCoordinator:
             )
         
         while active or deferred or pending:
-            # All workers dead => nothing can save us.
-            if all(w is None for w in workers):
-                logger.error(
-                    f"All {self.n_workers} workers are dead and unreplaceable. "
-                    f"Aborting with {len(pending)} pending and "
-                    f"{len(deferred)} deferred batches unprocessed."
+            # One "loop_iter" sample per scheduling-loop iteration.
+            with self._metrics.timer("loop_iter"):
+                self._metrics.gauge("pending", float(len(pending)))
+                self._metrics.gauge("active", float(len(active)))
+                self._metrics.gauge("deferred", float(len(deferred)))
+                # No standby pool exists yet (see the TODO in _replace_worker)
+                self._metrics.gauge("standby", 0.0)
+
+                # All workers dead => nothing can save us.
+                if all(w is None for w in workers):
+                    logger.error(
+                        f"All {self.n_workers} workers are dead and unreplaceable. "
+                        f"Aborting with {len(pending)} pending and "
+                        f"{len(deferred)} deferred batches unprocessed."
+                    )
+                    # Record terminal failures for every undispatched task so the JSONL accounts.
+                    undispatched = list(pending) + [
+                        (batch, rc) for _, batch, rc in deferred
+                    ]
+                    self._metrics.count(
+                        "failed",
+                        sum(len(batch) for batch, _ in undispatched),
+                    )
+                    self._record(aggregator, [
+                        EvalResult(
+                            task_id=task.task_id,
+                            score=0.0,
+                            response="",
+                            latency_seconds=0.0,
+                            batch_latency_seconds=None,
+                            failed=True,
+                            worker_id=-1,
+                            error="all workers dead before dispatch",
+                            failure_kind=FailureKind.TRANSIENT,
+                        )
+                        for batch, _ in undispatched
+                        for task in batch
+                    ])
+                    break
+                with self._metrics.timer("dispatch"):
+                    promote_ready_retries()
+                    dispatch_pending_to_idle()
+
+                if not active:
+                    # Everything in flight has drained and we're only waiting on a deferred retry.
+                    time.sleep(RETRY_POLL_INTERVAL)
+                    continue
+
+                with self._metrics.timer("ray_wait"):
+                    done_refs, _ = ray.wait(
+                        list(active.keys()),
+                        num_returns=1,
+                        timeout=RETRY_POLL_INTERVAL,
+                    )
+
+                if done_refs:
+                    done_ref = done_refs[0]
+                    worker_idx, batch, retry_count = active.pop(done_ref)
+                    ref_timeouts.pop(done_ref, None)
+
+                    try:
+                        results: list[EvalResult] = ray.get(done_ref)
+                        self._handle_success(results, aggregator)
+                    except Exception as exc:
+                        should_retry = self._handle_failure(
+                            exc=exc,
+                            batch=batch,
+                            worker_idx=worker_idx,
+                            retry_count=retry_count,
+                            workers=workers,
+                            aggregator=aggregator,
+                        )
+                        if should_retry:
+                            # Non-blocking: schedule for later, free the worker now.
+                            ready_at = time.monotonic() + backoff_seconds(retry_count)
+                            deferred.append((ready_at, batch, retry_count + 1))
+                            self._metrics.count("retried")
+
+                    with self._metrics.timer("dispatch"):
+                        self._assign_next(worker_idx, pending, submit)
+                # Scan every iteration, not only when ray.wait returns empty: under steady
+                # completions that gate starves exactly when the system is busiest.
+                self._handle_timeouts(
+                    active=active,
+                    ref_timeouts=ref_timeouts,
+                    workers=workers,
+                    pending=pending,
+                    submit=submit,
+                    aggregator=aggregator,
                 )
-                # Record terminal failures for every undispatched task so the JSONL accounts.
-                undispatched = list(pending) + [
-                    (batch, rc) for _, batch, rc in deferred
-                ]
-                self._record(aggregator, [
-                    EvalResult(
-                        task_id=task.task_id,
-                        score=0.0,
-                        response="",
-                        latency_seconds=0.0,
-                        batch_latency_seconds=None,
-                        failed=True,
-                        worker_id=-1,
-                        error="all workers dead before dispatch",
-                        failure_kind=FailureKind.TRANSIENT,
-                    )
-                    for batch, _ in undispatched
-                    for task in batch
-                ])
-                break
-            promote_ready_retries()
-            dispatch_pending_to_idle()
-
-            if not active:
-                # Everything in flight has drained and we're only waiting on a deferred retry.
-                time.sleep(RETRY_POLL_INTERVAL)
-                continue
-
-            done_refs, _ = ray.wait(
-                list(active.keys()),
-                num_returns=1,
-                timeout=RETRY_POLL_INTERVAL,
-            )
-
-            if done_refs:
-                done_ref = done_refs[0]
-                worker_idx, batch, retry_count = active.pop(done_ref)
-                ref_timeouts.pop(done_ref, None)
-
-                try:
-                    results: list[EvalResult] = ray.get(done_ref)
-                    self._handle_success(results, aggregator)
-                except Exception as exc:
-                    should_retry = self._handle_failure(
-                        exc=exc,
-                        batch=batch,
-                        worker_idx=worker_idx,
-                        retry_count=retry_count,
-                        workers=workers,
-                        aggregator=aggregator,
-                    )
-                    if should_retry:
-                        # Non-blocking: schedule for later, free the worker now.
-                        ready_at = time.monotonic() + backoff_seconds(retry_count)
-                        deferred.append((ready_at, batch, retry_count + 1))
-
-                self._assign_next(worker_idx, pending, submit)
-            # Scan every iteration, not only when ray.wait returns empty: under steady
-            # completions that gate starves exactly when the system is busiest.
-            self._handle_timeouts(
-                active=active,
-                ref_timeouts=ref_timeouts,
-                workers=workers,
-                pending=pending,
-                submit=submit,
-                aggregator=aggregator,
-            )
         if self._write_refs:
             ray.get(self._write_refs)
             self._write_refs = []
@@ -314,6 +334,7 @@ class DistributedEvalCoordinator:
             )
             if retry_count < task_max_retries:
                 pending.append((batch, retry_count + 1))
+                self._metrics.count("retried")
                 logger.info(
                     f"Re-queued {len(batch)} tasks "
                     f"(retry_count now {retry_count + 1}, "
@@ -324,6 +345,7 @@ class DistributedEvalCoordinator:
                     f"Batch hung {retry_count + 1} time(s); retry budget "
                     f"exhausted - recording {len(batch)} terminal failures"
                 )
+                self._metrics.count("failed", len(batch))
                 self._record(aggregator, [
                     EvalResult(
                         task_id=task.task_id,
@@ -351,14 +373,17 @@ class DistributedEvalCoordinator:
 
     # Helpers
     def _record(self, aggregator: object, results: list[EvalResult]) -> None:
-        for result in results:
-            self._write_refs.append(aggregator.add_result.remote(result))
+        # "agg_submit" times only submission (.remote() is fire-and- forget)
+        with self._metrics.timer("agg_submit"):
+            for result in results:
+                self._write_refs.append(aggregator.add_result.remote(result))
     
     def _handle_success(
         self, 
         results: list[EvalResult], 
         aggregator: object,
     ) -> None:
+        self._metrics.count("completed", len(results))
         self._record(aggregator, results)
 
     def _handle_failure(
@@ -394,6 +419,7 @@ class DistributedEvalCoordinator:
             return True
 
         # Terminal failure: one EvalResult per task.
+        self._metrics.count("failed", len(batch))
         self._record(aggregator, [
             EvalResult(
                 task_id=task.task_id,
@@ -520,6 +546,7 @@ class DistributedEvalCoordinator:
     ) -> bool:
         """replace a worker with bounded retries."""
         # TODO: still blocks on model load. need standby pool for big models.
+        self._metrics.count("replaced")
         old = workers[failed_idx]
         workers[failed_idx] = None  # nothing dispatches here while we work
         if old is not None:

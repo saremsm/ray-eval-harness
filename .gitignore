@@ -7,3 +7,7 @@ __pycache__/
 .DS_Store
 results/*.jsonl
 .venv*/
+bench/results/*
+!bench/results/.gitkeep
+!bench/results/published/
+!bench/results/published/**
