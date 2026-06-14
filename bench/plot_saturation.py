@@ -14,11 +14,14 @@ def load_reports(paths: list[str]) -> list[dict]:
     files: list[str] = []
     for path in paths:
         if os.path.isdir(path):
-            files.extend(
-                os.path.join(path, f)
-                for f in sorted(os.listdir(path))
-                if f.endswith(".json")
-            )
+            # Recurse: published grids live in subdirectories (rep1/, faulted/, ...).
+            for root, dirs, names in os.walk(path):
+                dirs.sort()
+                files.extend(
+                    os.path.join(root, f)
+                    for f in sorted(names)
+                    if f.endswith(".json")
+                )
         else:
             files.append(path)
     reports = []
@@ -32,45 +35,79 @@ def load_reports(paths: list[str]) -> list[dict]:
     return reports
 
 
-def curves_by_batch(reports: list[dict]) -> dict[int, list[tuple[float, float]]]:
-    """batch_size -> [(offered, achieved)] sorted by offered load."""
-    curves: dict[int, list[tuple[float, float]]] = defaultdict(list)
+def curve_label(batch: int, fail_rate: float) -> str:
+    return (
+        f"batch={batch}"
+        if fail_rate == 0.0
+        else f"batch={batch} fail={fail_rate:g}"
+    )
+
+
+def curves_by_batch(
+    reports: list[dict],
+) -> dict[tuple[int, float], list[tuple[float, float]]]:
+    """(batch_size, fail_rate) -> [(offered, achieved)] sorted by offered. Runs with
+    different fail rates are different experiments and get separate curves."""
+    curves: dict[
+        tuple[int, float], list[tuple[float, float]]
+    ] = defaultdict(list)
     for r in reports:
         batch = int(r["args"]["batch_size"])
+        fail_rate = float(r["args"].get("fail_rate", 0.0))
         offered = float(r["offered_load_tasks_per_s"])
         achieved = float(r["achieved"]["throughput_tasks_per_s_wall"])
-        curves[batch].append((offered, achieved))
-    for batch in curves:
-        curves[batch].sort()
+        curves[(batch, fail_rate)].append((offered, achieved))
+    for key in curves:
+        curves[key].sort()
     return dict(sorted(curves.items()))
 
 
-def analyze(label: str, curves: dict[int, list[tuple[float, float]]]) -> None:
-    for batch, points in curves.items():
-        knee = next(
+def analyze(
+    label: str,
+    curves: dict[tuple[int, float], list[tuple[float, float]]],
+) -> None:
+    for (batch, fail_rate), points in curves.items():
+        knee_i = next(
             (
-                (off, ach)
-                for off, ach in points
+                i
+                for i, (off, ach) in enumerate(points)
                 if ach < KNEE_RATIO * off
             ),
             None,
         )
         max_achieved = max(ach for _, ach in points)
-        knee_txt = (
-            f"knee at offered {knee[0]:.1f} tasks/s "
-            f"(achieved {knee[1]:.1f})"
-            if knee
-            else f"no knee (all points >= {KNEE_RATIO:.0%} of offered)"
-        )
+        if knee_i is None:
+            knee_txt = f"no knee (all points >= {KNEE_RATIO:.0%} of offered)"
+        else:
+            off, ach = points[knee_i]
+            knee_txt = (
+                f"knee at offered {off:.1f} tasks/s (achieved {ach:.1f})"
+            )
+            # A marginal knee can re-cross the line at higher offered load.
+            recross = next(
+                (
+                    o
+                    for o, a in points[knee_i + 1:]
+                    if a >= KNEE_RATIO * o
+                ),
+                None,
+            )
+            if recross is not None:
+                knee_txt += (
+                    f" [curve re-crosses {KNEE_RATIO:.0%} at offered "
+                    f"{recross:.1f}; knee is marginal]"
+                )
         print(
-            f"[{label}] batch={batch}: {knee_txt}; "
+            f"[{label}] {curve_label(batch, fail_rate)}: {knee_txt}; "
             f"max achieved {max_achieved:.1f} tasks/s "
             f"over {len(points)} points"
         )
 
 
 def plot(
-    datasets: list[tuple[str, dict[int, list[tuple[float, float]]]]],
+    datasets: list[
+        tuple[str, dict[tuple[int, float], list[tuple[float, float]]]]
+    ],
     out: str,
 ) -> None:
     import matplotlib
@@ -83,13 +120,12 @@ def plot(
     all_offered: list[float] = []
     for i, (label, curves) in enumerate(datasets):
         style = linestyles[i % len(linestyles)]
-        for batch, points in curves.items():
+        for (batch, fail_rate), points in curves.items():
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
             all_offered.extend(xs)
-            name = f"batch={batch}" if len(datasets) == 1 else (
-                f"{label} batch={batch}"
-            )
+            base = curve_label(batch, fail_rate)
+            name = base if len(datasets) == 1 else f"{label} {base}"
             ax.plot(xs, ys, style, marker="o", label=name)
     if all_offered:
         lim = sorted(all_offered)

@@ -9,5 +9,6 @@ results/*.jsonl
 .venv*/
 bench/results/*
 !bench/results/.gitkeep
+!bench/results/BASELINE.md
 !bench/results/published/
 !bench/results/published/**
