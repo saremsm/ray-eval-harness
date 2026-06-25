@@ -9,7 +9,7 @@ Ray-based eval harness for LLMs with mid-generation hooks. Built to explore the 
 - A streaming intervention API (`evaluate_with_hooks`) with per-token callbacks. The HF backend uses `StoppingCriteria` so hooks run synchronously inside `generate()` and can actually halt the model. The vLLM backend uses `AsyncLLMEngine` so hooks observe the engine's continuous-batching scheduler in real time and abort with `engine.abort(request_id)`. Hook-observed state (e.g. which trigger fired) returns to the caller via `EvalResult.hook_state`.
 - Deterministic fault injection coordinated through a shared actor, so the same `--seed` reproduces the same failure pattern across runs regardless of how Ray scheduled work.
 - A rubric scorer with named, weighted conditions and per-condition aggregation.
-- An aggregator actor that serializes concurrent writes from many workers into one JSONL stream without explicit locking.
+- A sharded results aggregator: a driver-side facade over N `ResultsAggregator` actors (`--aggregator-shards`, default 1) that serializes concurrent writes into per-shard JSONL streams without explicit locking, batches one actor call per shard per completed batch, and merges a single summary at end of run.
 - Unit tests for the pure modules and integration tests for the coordinator using an in-memory fake backend, so tests don't need GPUs or model loads.
 
 ## Architecture
@@ -28,11 +28,17 @@ Ray-based eval harness for LLMs with mid-generation hooks. Built to explore the 
         +-----+-----+         +-----+-----+        +-----+-----+
               |                     |                    |
               +---------------------+--------------------+
-                                    | add_result.remote(...)
+                                    | record_batch (one call per
+                                    | shard per completed batch)
                         +-----------v------------+
-                        |  ResultsAggregator     |
-                        |  (actor; JSONL writer) |
-                        +------------------------+
+                        |  ShardedAggregator     |
+                        |  (driver-side facade)  |
+                        +--+--------+--------+---+
+                           |        |        |
+                     +-----v--+ +---v----+ +-v------+
+                     |Results | |Results | |Results |
+                     |Aggr. 0 | |Aggr. 1 | |Aggr. N-1  (actors;
+                     +--------+ +--------+ +--------+  JSONL shards)
 ```
 
 Worker pools are homogeneous - all HF or all vLLM per run, selected by `--backend` (mixed pools are not built). The coordinator never touches worker state directly. All communication goes through Ray's actor mailbox, which serializes calls per-actor.
@@ -83,7 +89,7 @@ The derived value is logged at startup and reported in the summary as `hang_thre
 
 **Tuples in `pending`.** Retries re-append to `pending`, and a re-queued batch needs to remember how many times it's been tried. Keeping the count in the tuple means the budget is enforced on every retry path, including hangs.
 
-**Aggregator as an actor, writes as fire-and-forget.** Many workers writing one JSONL file becomes "many workers calling `add_result.remote(...)` on one actor." Ray serializes actor methods for free - no `fcntl`, no threading lock. The coordinator doesn't block on each write: actor tasks from one caller execute in submission order, so the end-of-run `get_summary` is guaranteed to see every write; the write refs are drained at the end so exceptions still surface.
+**Sharded aggregator behind a plain-Python facade, writes as fire-and-forget.** Concurrent JSONL writing stays "call a method on an actor" - Ray serializes actor methods for free, no `fcntl`, no threading lock - but batched writes puts a driver-side `ShardedAggregator` facade in front of N `ResultsAggregator` actors, routed by `crc32(task_id) % N` (deliberately not the builtin `hash()`, which is salted per process and would make routing non-reproducible). `record_batch` issues ONE actor call per shard touched per completed batch, never one per result - the overlay finding was that the per-result submit path is the harness ceiling. The coordinator doesn't block on writes; the refs are drained at end of run, then `finalize()` concatenates the per-shard JSONLs into `--output` (every result exactly once, grouped by shard in per-shard completion order - the file is **not** globally ordered) and `get_summary()` merges: counters and sums added, min/max taken across shards, condition scores pooled, latency reservoirs concatenated, elapsed/throughput from the facade's shared start time. Each shard keeps a uniform latency reservoir capped at M = 100,000 samples, so latency *percentiles* are approximate once a shard exceeds M succeeded results (means and counts stay exact - they use running sums). `--aggregator-shards` defaults to 1 - a strict passthrough that is behaviorally identical to the pre-shard single actor, pinned by test - until the shard sweep sweep measures a better value.
 
 **Shared `FailureDecider` actor for deterministic injection.** The naive design - each worker holds its own seeded RNG - gives reproducible *per-worker* sequences but not reproducible *task-level* failures, because Ray's scheduler routes batches non-deterministically. A single decider actor that all fault-injecting workers query makes failure a function of `(seed, batch_content, attempt_number)` rather than which worker happened to receive the batch.
 
@@ -99,7 +105,7 @@ The derived value is logged at startup and reported in the summary as `hang_thre
 ├── coordinator.py               # work-stealing scheduler, retry, hang detection
 ├── worker.py                    # HFWorker and VLLMWorker actors
 ├── fault_injection.py           # FailureDecider + fault-injecting worker subclasses
-├── aggregator.py                # ResultsAggregator actor (JSONL + stats)
+├── aggregator.py                # ResultsAggregator shard actor + ShardedAggregator facade
 ├── scoring.py                   # rubric scorer + condition checkers
 ├── hooks.py                     # LoggingHook, EarlyStoppingHook
 ├── types_.py                    # dataclasses, enums, Protocols
@@ -246,8 +252,10 @@ results with and without recording - on top of the whole pre-existing suite
 running against the instrumented coordinator with the null default.
 
 One caveat the report states explicitly: **Ray exposes no actor mailbox
-depth**, so aggregator backlog is measured as `add_result` call latency
-(submit-to-ready, sampled every Nth call from the coordinator side). The
+depth**, so aggregator backlog is measured as submit-to-ready call latency,
+sampled every Nth call from the coordinator side (per-result `add_result`
+when the saturation bench/the baseline numbers were taken; since batched writes the coordinator submits
+`record_batch` per shard per batch, and the probe follows that call). The
 actor drains its mailbox FIFO, so call latency *is* queue depth expressed in
 seconds - a proxy, and labeled as one in the JSON.
 
@@ -330,7 +338,7 @@ And the items in **Bugs found and fixed** above - most notably the unkilled-acto
 These are real and worth knowing about; none are showstoppers.
 
 - **Whole-batch retry on partial failure.** When one task in a batch fails, the entire batch is re-queued. At vLLM batch sizes (64+), this re-runs many successful generations to recover one failure. Per-task retry, or splitting a failed batch in half on retry, would be the natural improvements.
-- **The single aggregator actor caps throughput at thousands of QPS.** Sharded aggregators keyed by `task_id % N` would scale linearly but aren't implemented. The same shape applies to the `FailureDecider`, which is also a single actor by design (with an unbounded per-batch attempt map) and would need sharding and eviction for multi-thousand-worker injection.
+- **Aggregator sharding exists but ships unmeasured, and it costs global order.** `--aggregator-shards N` fans results out to N `ResultsAggregator` actors keyed by `crc32(task_id) % N`; the default stays 1 (identical to the old single actor) until the shard sweep sweep measures where the knee actually moves. With N > 1 the concatenated `results.jsonl` is no longer globally ordered (grouped by shard, per-shard completion order - re-sort by `task_id` if you need determinism), and latency percentiles in the merged summary are approximate once any shard exceeds its M = 100,000-sample reservoir (means/counts stay exact). The `FailureDecider` remains a single actor by design (with an unbounded per-batch attempt map) and would need the same sharding treatment plus eviction for multi-thousand-worker injection.
 - **Worker replacement blocks the scheduling loop.** The old actor is now killed immediately and the slot marked dead first, but constructing the replacement still blocks on model load - minutes at 70B scale - during which completed refs from healthy workers sit unharvested. A standby pool (workers pre-loaded and idle) or backgrounded replacement would make it O(1); neither is built.
 - **`tokens_generated` is left at 0 on the HF batch path.** Reported accurately on the hooked path (counted from criterion calls) and on vLLM batch (from `len(token_ids)`). Re-tokenizing the response string round-trips through BPE merges and isn't guaranteed to match the generated count, so the field stays unset rather than reporting a wrong number. Plumbing token IDs out of the HF pipeline is the proper fix.
 - **`tensor_parallel_size > 1` is wired through but only verified at `tp=1`.** The coordinator passes `tp` to both initial creation and worker replacement, the actor's `@ray.remote(num_gpus=tp)` claim follows from it, but a real multi-GPU run also wants `STRICT_PACK` placement groups for colocation; that piece isn't built. Single-GPU and CPU paths are exercised end-to-end on real hardware; multi-GPU and multi-node are designed-in but not run in anger.

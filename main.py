@@ -255,6 +255,20 @@ def main() -> None:
         "--output", type=str, default="results/results.jsonl",
         help="Path for JSONL results (default: results/results.jsonl)",
     )
+    parser.add_argument(
+        "--aggregator-shards", type=int, default=1,
+        dest="aggregator_shards",
+        help=(
+            "Number of ResultsAggregator shard actors, keyed by a "
+            "stable hash of task_id. Default: 1 (single actor, the "
+            "pre-shard behavior) until the shard sweep sweep measures a better "
+            "value. With N > 1, per-shard JSONLs are written next to "
+            "--output as <stem>.shardK.jsonl and concatenated into "
+            "--output at end of run; the concatenated file contains "
+            "every result exactly once but is NOT globally ordered "
+            "(grouped by shard, completion order within each shard)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.dry_run:
@@ -268,6 +282,14 @@ def main() -> None:
     
     if args.workers < 1:
         print(f"Error: --workers must be at least 1, got {args.workers}.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.aggregator_shards < 1:
+        print(
+            f"Error: --aggregator-shards must be at least 1, "
+            f"got {args.aggregator_shards}.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     
     ray.init(ignore_reinit_error=True)
@@ -284,6 +306,7 @@ def main() -> None:
         task_timeout=args.task_timeout,
         output_path=args.output,
         batch_size=args.batch_size,
+        aggregator_shards=args.aggregator_shards,
         worker_cls=worker_cls,
         worker_kwargs=worker_kwargs,
         hf_device=args.hf_device,

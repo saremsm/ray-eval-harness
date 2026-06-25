@@ -5,6 +5,7 @@ from unittest.mock import patch
 from collections import deque
 
 import coordinator as coord_mod
+from aggregator import shard_index
 from types_ import EvalResult, EvalTask, FailureKind
 from coordinator import (
     DistributedEvalCoordinator,
@@ -75,17 +76,16 @@ class _FakeWorker:
     def get_stats(self): return {}
 
 class _CapturingAggregator:
-    """records add_result payloads."""
-    class _Method:
-        def __init__(self, fn):
-            self.fn = fn
-
-        def remote(self, *args, **kwargs):
-            return self.fn(*args, **kwargs)
+    """Facade-shaped fake: records record_batch payloads."""
 
     def __init__(self):
         self.results = []
-        self.add_result = self._Method(self.results.append)
+        self.batches = []
+
+    def record_batch(self, results):
+        self.batches.append(list(results))
+        self.results.extend(results)
+        return []
 
 # Validate Backend
 class TestValidateBackend:
@@ -478,12 +478,17 @@ class _FakeRef:
 
 
 class _FakeAggregator:
-    """Captures add_result and get_summary calls."""
+    """Shard-actor fake: captures record_batch / get_summary / get_shard_state /."""
+
+    instances: list["_FakeAggregator"] = []
 
     def __init__(self, total_tasks: int, output_path: str) -> None:
         self.total_tasks = total_tasks
         self.output_path = output_path
         self.results: list[EvalResult] = []
+        self.record_batch_calls = 0
+        self.closed = False
+        _FakeAggregator.instances.append(self)
 
     @classmethod
     def remote(cls, total_tasks: int, output_path: str) -> "_FakeAggregator":
@@ -500,7 +505,15 @@ class _FakeAggregator:
                 return _FakeRef(exception=exc)
 
     @property
+    def record_batch(self):
+        def _fn(results: list[EvalResult]) -> None:
+            self.record_batch_calls += 1
+            self.results.extend(results)
+        return _FakeAggregator._Method(_fn)
+
+    @property
     def add_result(self):
+        # Back-compat shim, same as the real actor's.
         def _fn(result: EvalResult) -> None:
             self.results.append(result)
         return _FakeAggregator._Method(_fn)
@@ -514,6 +527,49 @@ class _FakeAggregator:
                 "failed": sum(1 for r in self.results if r.failed),
                 "results_file": self.output_path,
             }
+        return _FakeAggregator._Method(_fn)
+
+    @property
+    def get_shard_state(self):
+        # Pins the shard-state contract the facade merges.
+        def _fn() -> dict:
+            succ = [r for r in self.results if r.succeeded]
+            batch_lat = [
+                r.batch_latency_seconds for r in succ
+                if r.batch_latency_seconds is not None
+            ]
+            per_worker: dict[int, int] = {}
+            for r in self.results:
+                per_worker[r.worker_id] = per_worker.get(r.worker_id, 0) + 1
+            return {
+                "count": len(self.results),
+                "succeeded": len(succ),
+                "failed": sum(1 for r in self.results if r.failed),
+                "stopped_early": sum(1 for r in succ if r.stopped_early),
+                "score_sum": sum(r.score for r in succ),
+                "score_min": min(
+                    (r.score for r in succ), default=float("inf")
+                ),
+                "score_max": max(
+                    (r.score for r in succ), default=float("-inf")
+                ),
+                "latency_sum": sum(r.latency_seconds for r in succ),
+                "latency_samples": [r.latency_seconds for r in succ],
+                "latency_seen": len(succ),
+                "batch_latency_samples": batch_lat,
+                "batch_latency_seen": len(batch_lat),
+                "tokens_total": sum(r.tokens_generated for r in succ),
+                "per_worker": per_worker,
+                "condition_scores": [
+                    r.condition_scores for r in succ if r.condition_scores
+                ],
+            }
+        return _FakeAggregator._Method(_fn)
+
+    @property
+    def close(self):
+        def _fn() -> None:
+            self.closed = True
         return _FakeAggregator._Method(_fn)
 
 
@@ -652,6 +708,7 @@ def _coordinator_with_fake_workers(
     max_retries: int = 2,
     delay: float = 0.0,
     batch_size: int = 4,
+    aggregator_shards: int = 1,
 ) -> tuple[DistributedEvalCoordinator, list[EvalTask]]:
     """Build coordinator wired to fake workers and a fake aggregator."""
     n_workers = len(plan_per_worker)
@@ -676,6 +733,7 @@ def _coordinator_with_fake_workers(
         output_path="results/test.jsonl",
         batch_size=batch_size,
         aggregator_cls=_FakeAggregator,
+        aggregator_shards=aggregator_shards,
         worker_cls=_BackendStub,
     )
     
@@ -797,3 +855,95 @@ class TestCoordinatorIntegration:
         )
         assert summary["failed"] == 8
         assert summary["succeeded"] == 0
+
+
+class TestCoordinatorShardedAggregator:
+    """run() with aggregator_shards > 1: the facade fans results out to N shard."""
+
+    def test_ctor_default_is_single_shard(self):
+        coord = make_coordinator()
+        assert coord.aggregator_shards == 1, (
+            "Default must stay 1 until a sweep measures a better "
+            "value."
+        )
+
+    def test_ctor_rejects_zero_shards(self):
+        with pytest.raises(ValueError, match="aggregator_shards"):
+            make_coordinator(aggregator_shards=0)
+
+    def test_sharded_run_completes_all_tasks(self, patched_ray):
+        _FakeAggregator.instances.clear()
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["ok"] * 8, ["ok"] * 8],
+            n_tasks=8,
+            batch_size=4,
+            aggregator_shards=3,
+        )
+        summary = coord.run(tasks)
+
+        # Merged summary comes from aggregator._summarize_state.
+        assert summary["total"] == 8
+        assert summary["succeeded"] == 8
+        assert summary["failed"] == 0
+        assert summary["aggregator_shards"] == 3
+        assert len(summary["results_files"]) == 3
+        assert "shard0" in summary["results_files"][0]
+
+        shards = _FakeAggregator.instances
+        assert len(shards) == 3
+
+        # Every task reaches exactly one shard, exactly once.
+        recorded = [r.task_id for s in shards for r in s.results]
+        assert sorted(recorded) == sorted(t.task_id for t in tasks)
+
+        # Routing is the facade's stable hash, per shard.
+        for i, shard in enumerate(shards):
+            for r in shard.results:
+                assert shard_index(r.task_id, 3) == i, (
+                    f"task {r.task_id} landed on shard {i} but hashes "
+                    f"to {shard_index(r.task_id, 3)}"
+                )
+
+        # finalize() sealed every shard.
+        assert all(s.closed for s in shards)
+
+    def test_sharded_run_batches_shard_calls(self, patched_ray):
+        """One record_batch call per shard per completed batch - never one call per
+        result. 8 tasks in 2 batches of 4 across 3 shards can produce at most 6
+        shard calls; 8 calls would mean the per-result path came back."""
+        _FakeAggregator.instances.clear()
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["ok"] * 8, ["ok"] * 8],
+            n_tasks=8,
+            batch_size=4,
+            aggregator_shards=3,
+        )
+        summary = coord.run(tasks)
+        assert summary["total"] == 8
+
+        shards = _FakeAggregator.instances
+        total_calls = sum(s.record_batch_calls for s in shards)
+        n_batches = 2
+        assert total_calls <= n_batches * 3, (
+            f"{total_calls} shard calls for {n_batches} batches x 3 "
+            "shards max - record_batch must group per shard, not "
+            "submit per result"
+        )
+        assert total_calls < 8, "looks like one call per result"
+
+    def test_single_shard_run_uses_requested_output_path(self, patched_ray):
+        """N=1 must be today's behavior: one shard actor at exactly the requested
+        output path, no '.shardK' suffix, no merged-summary extras."""
+        _FakeAggregator.instances.clear()
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["ok"] * 8, ["ok"] * 8],
+            n_tasks=8,
+        )
+        summary = coord.run(tasks)
+        shards = _FakeAggregator.instances
+        assert len(shards) == 1
+        assert shards[0].output_path == "results/test.jsonl"
+        # Passthrough summary: the shard's own dict, untouched.
+        assert summary["results_file"] == "results/test.jsonl"
+        assert "results_files" not in summary
+        assert "aggregator_shards" not in summary

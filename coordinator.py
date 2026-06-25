@@ -7,7 +7,7 @@ from collections import deque
 import ray
 import random
 
-from aggregator import ResultsAggregator
+from aggregator import ResultsAggregator, ShardedAggregator
 from metrics import NULL_METRICS
 from types_ import EvalResult, EvalTask, FailureKind
 
@@ -65,7 +65,7 @@ def backoff_seconds(retry_count: int, rng: random.Random | None = None) -> float
     return r.uniform(0, base)
 
 class DistributedEvalCoordinator:
-    """Work-Stealing coordinator across a pool of EvalWorker actors. aggregator_cls."""
+    """Work-Stealing coordinator across a pool of EvalWorker actors."""
     def __init__(
         self,
         n_workers: int,
@@ -76,6 +76,7 @@ class DistributedEvalCoordinator:
         output_path: str = "results/results.jsonl",
         batch_size: int | None = None,
         aggregator_cls=ResultsAggregator,
+        aggregator_shards: int = 1,
         worker_cls=None,
         worker_kwargs: dict | None = None,
         tensor_parallel_size: int = 1,
@@ -112,6 +113,12 @@ class DistributedEvalCoordinator:
         self._metrics = NULL_METRICS
 
         self._aggregator_cls = aggregator_cls
+        # Number of ResultsAggregator shard actors behind the ShardedAggregator
+        if aggregator_shards < 1:
+            raise ValueError(
+                f"aggregator_shards must be >= 1, got {aggregator_shards}"
+            )
+        self.aggregator_shards = aggregator_shards
         self._write_refs: list = []
         self._worker_cls = worker_cls or (
             VLLMWorker if backend == "vllm" else HFWorker
@@ -125,9 +132,13 @@ class DistributedEvalCoordinator:
         blocking retry: failed batch -> deferred[] with wake-up time. back to
         pending[] when time hits. main loop keeps draining"""
         workers = self._create_workers()
-        aggregator = self._aggregator_cls.remote( 
-            total_tasks=len(tasks), 
+        # Driver-side facade over N shard actors (batched writes).
+        #   aggregator_shards=1 this is a passthrough around a single
+        aggregator = ShardedAggregator(
+            total_tasks=len(tasks),
             output_path=self.output_path,
+            n_shards=self.aggregator_shards,
+            aggregator_cls=self._aggregator_cls,
         )
         self._write_refs = []
         # Ready to dispatch.
@@ -292,7 +303,9 @@ class DistributedEvalCoordinator:
 
         live_workers = [w for w in workers if w is not None]
         worker_stats = ray.get([w.get_stats.remote() for w in live_workers])
-        summary = ray.get(aggregator.get_summary.remote())
+        # Seal shard files and (for aggregator_shards > 1) concatenate them into.
+        aggregator.finalize()
+        summary = aggregator.get_summary()
         summary["worker_stats"] = worker_stats
         summary["hang_threshold_s"] = self.hang_threshold_s
         return summary
@@ -375,8 +388,7 @@ class DistributedEvalCoordinator:
     def _record(self, aggregator: object, results: list[EvalResult]) -> None:
         # "agg_submit" times only submission (.remote() is fire-and- forget)
         with self._metrics.timer("agg_submit"):
-            for result in results:
-                self._write_refs.append(aggregator.add_result.remote(result))
+            self._write_refs.extend(aggregator.record_batch(results))
     
     def _handle_success(
         self, 

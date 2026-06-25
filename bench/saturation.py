@@ -1,6 +1,4 @@
-"""Saturation bench: find where the coordinator saturates. (The stage doc calls this
-method "record_batch"; in this codebase it is `ResultsAggregator.add_result` -
-same role.) * pending/active/deferred/standby sampled on a 0.5s grid."""
+"""Saturation bench: find where the coordinator saturates."""
 
 from __future__ import annotations
 
@@ -28,7 +26,7 @@ GAUGE_SAMPLE_INTERVAL_S = 0.5
 
 # Aggregator call-latency probe
 class AggregatorCallProbe:
-    """Measures add_result submit-to-ready latency from the driver side."""
+    """Measures record_batch submit-to-ready latency from the driver side."""
 
     def __init__(self, every: int = 32) -> None:
         self.every = max(1, every)
@@ -81,7 +79,7 @@ class AggregatorCallProbe:
 
             def __getattr__(self, name):
                 method = getattr(self._handle, name)
-                if name == "add_result":
+                if name in ("record_batch", "add_result"):
                     return _ProbedMethod(method)
                 return method
 
@@ -96,9 +94,11 @@ class AggregatorCallProbe:
         s = sorted(self.samples)
         return {
             "note": (
-                "add_result submit-to-ready latency measured coordinator-"
-                "side; Ray exposes no actor mailbox depth, so FIFO call "
-                "latency is the proxy for aggregator queue depth"
+                "record_batch submit-to-ready latency measured "
+                "coordinator-side; Ray exposes no actor mailbox depth, "
+                "so FIFO call latency is the proxy for aggregator "
+                "queue depth (one sample = one shard call, not one "
+                "result)"
             ),
             "probe_every_nth_call": self.every,
             "samples": len(s),
@@ -131,9 +131,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Latency jitter fraction: sleep = latency_s * "
                         "(1 + jitter * U(-1, 1))")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--aggregator-shards", type=int, default=1,
+                   dest="aggregator_shards",
+                   help="ResultsAggregator shard actors behind the "
+                        "ShardedAggregator facade (default 1 = the "
+                        "pre-shard single actor); the dial the shard sweep "
+                        "sweep turns")
     p.add_argument("--agg-probe-every", type=int, default=32,
                    dest="agg_probe_every",
-                   help="Sample every Nth add_result call for the "
+                   help="Sample every Nth record_batch call for the "
                         "call-latency proxy (bounds probe overhead)")
     p.add_argument("--out", type=str, default=None,
                    help="JSON report path (default: bench/results/"
@@ -186,6 +192,7 @@ def run_saturation(ns: argparse.Namespace) -> dict:
         output_path=jsonl_path,
         batch_size=ns.batch_size,
         aggregator_cls=probe.wrap(ResultsAggregator),
+        aggregator_shards=ns.aggregator_shards,
         worker_cls=FakeLatencyWorker,
         worker_kwargs=worker_kwargs,
     )
@@ -301,7 +308,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     lat = report["agg_call_latency"]
     print(
-        f"add_result call latency (mailbox proxy): "
+        f"record_batch call latency (mailbox proxy): "
         f"p50={lat['p50_s'] * 1000:.1f}ms p99={lat['p99_s'] * 1000:.1f}ms "
         f"({lat['samples']} samples)"
     )
