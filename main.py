@@ -78,21 +78,23 @@ def _bar_chars() -> tuple[str, str]:
     except (UnicodeEncodeError, LookupError):
         return "#", "-"
 
-def _build_fault_injection(backend: str, failure_rate: float, seed: int):
-    """Pick the fault-injecting worker class and create a shared"""
+def _build_fault_injection(
+    backend: str, failure_rate: float, seed: int, decider_shards: int = 1
+):
+    """Pick the fault-injecting worker class and create the shared decider."""
     if failure_rate <= 0.0:
         return None, None
     # Fault-injecting subclasses live in their own module so the production
     from fault_injection import (
-        FailureDecider,
         FaultInjectingHFWorker,
         FaultInjectingVLLMWorker,
+        ShardedFailureDecider,
     )
     worker_cls = (
         FaultInjectingVLLMWorker if backend == "vllm"
         else FaultInjectingHFWorker
     )
-    decider = FailureDecider.remote(seed=seed)
+    decider = ShardedFailureDecider(seed=seed, n_shards=decider_shards)
     worker_kwargs = {"failure_rate": failure_rate, "decider": decider}
     return worker_cls, worker_kwargs
 
@@ -269,6 +271,19 @@ def main() -> None:
             "(grouped by shard, completion order within each shard)."
         ),
     )
+    parser.add_argument(
+        "--decider-shards", type=int, default=1,
+        dest="decider_shards",
+        help=(
+            "Number of FailureDecider shard actors behind the "
+            "ShardedFailureDecider facade, keyed by a stable hash of "
+            "the batch key. Only used when --failure-rate > 0. "
+            "Sharding cannot change which batches fail: decisions are "
+            "a pure function of (seed, batch_key, attempt, "
+            "failure_rate) and routing is key-only, so attempt "
+            "counters keep shard affinity (default: 1)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.dry_run:
@@ -291,12 +306,20 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if args.decider_shards < 1:
+        print(
+            f"Error: --decider-shards must be at least 1, "
+            f"got {args.decider_shards}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     
     ray.init(ignore_reinit_error=True)
 
     tasks = make_tasks(args.tasks)
     worker_cls, worker_kwargs = _build_fault_injection(
-        args.backend, args.failure_rate, args.seed
+        args.backend, args.failure_rate, args.seed, args.decider_shards
     )
     coordinator = DistributedEvalCoordinator(
         n_workers=args.workers,

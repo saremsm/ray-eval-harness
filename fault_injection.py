@@ -32,6 +32,55 @@ class FailureDeciderImpl:
 FailureDecider = ray.remote(FailureDeciderImpl)
 
 
+def decider_shard_index(batch_key: tuple, n_shards: int) -> int:
+    """Stable decider routing: hash(batch_key) % n_shards."""
+    return _stable_seed(batch_key) % n_shards
+
+
+class _ShardRouterMethod:
+    """Makes ShardedFailureDecider.should_fail look exactly like an actor method."""
+
+    def __init__(self, facade: "ShardedFailureDecider") -> None:
+        self._facade = facade
+
+    def remote(self, batch_key: tuple, failure_rate: float):
+        return self._facade._shard_for(batch_key).should_fail.remote(
+            batch_key, failure_rate
+        )
+
+
+class ShardedFailureDecider:
+    """Plain-Python facade over N FailureDecider actors, sharded by a stable hash of
+    batch_key (see decider_shard_index)."""
+
+    def __init__(
+        self,
+        seed: int = 0,
+        n_shards: int = 1,
+        decider_cls=FailureDecider,
+    ) -> None:
+        if n_shards < 1:
+            raise ValueError(f"n_shards must be >= 1, got {n_shards}")
+        self.seed = seed
+        self.n_shards = n_shards
+        # Every shard gets the SAME seed: the decision seed already mixes in
+        self._shards = [
+            decider_cls.remote(seed=seed) for _ in range(n_shards)
+        ]
+
+    def shard_for(self, batch_key: tuple) -> int:
+        return decider_shard_index(batch_key, self.n_shards)
+
+    def _shard_for(self, batch_key: tuple):
+        if self.n_shards == 1:
+            return self._shards[0]
+        return self._shards[self.shard_for(batch_key)]
+
+    @property
+    def should_fail(self) -> _ShardRouterMethod:
+        return _ShardRouterMethod(self)
+
+
 class FaultInjectingHFWorkerImpl(HFWorkerImpl):
     """HFWorkerImpl plus deterministic fault injection."""
 

@@ -15,7 +15,7 @@ import ray
 
 from aggregator import ResultsAggregator
 from coordinator import DistributedEvalCoordinator
-from fault_injection import FailureDecider
+from fault_injection import ShardedFailureDecider
 from types_ import EvalTask
 
 from bench.fake_worker import FakeLatencyWorker
@@ -125,8 +125,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=8, dest="batch_size")
     p.add_argument("--tasks", type=int, default=2000)
     p.add_argument("--fail-rate", type=float, default=0.0, dest="fail_rate",
-                   help="Injected batch failure rate via FailureDecider; "
-                        "> 0 exercises the retry machinery under load")
+                   help="Injected batch failure rate via the shared "
+                        "decider; > 0 exercises the retry machinery "
+                        "under load")
     p.add_argument("--jitter", type=float, default=0.1,
                    help="Latency jitter fraction: sleep = latency_s * "
                         "(1 + jitter * U(-1, 1))")
@@ -137,6 +138,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "ShardedAggregator facade (default 1 = the "
                         "pre-shard single actor); the dial the shard sweep "
                         "sweep turns")
+    p.add_argument("--decider-shards", type=int, default=1,
+                   dest="decider_shards",
+                   help="FailureDecider shard actors; only used "
+                        "when --fail-rate > 0. Sharding provably "
+                        "cannot change which batches fail (key-only "
+                        "routing, shared seed), so faulted overlays "
+                        "stay comparable across shard counts")
     p.add_argument("--agg-probe-every", type=int, default=32,
                    dest="agg_probe_every",
                    help="Sample every Nth record_batch call for the "
@@ -170,7 +178,8 @@ def run_saturation(ns: argparse.Namespace) -> dict:
     jsonl_path = os.path.join(tmpdir, "results.jsonl")
 
     decider = (
-        FailureDecider.remote(seed=ns.seed) if ns.fail_rate > 0.0 else None
+        ShardedFailureDecider(seed=ns.seed, n_shards=ns.decider_shards)
+        if ns.fail_rate > 0.0 else None
     )
     worker_kwargs = {
         "latency_s": ns.latency_s,
