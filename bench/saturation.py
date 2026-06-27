@@ -145,10 +145,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "cannot change which batches fail (key-only "
                         "routing, shared seed), so faulted overlays "
                         "stay comparable across shard counts")
-    p.add_argument("--agg-probe-every", type=int, default=32,
+    # Default 4, not the earlier 32: the probed unit changed from one add_result
+    # call per RESULT to one record_batch call per BATCH per shard, an
+    # ~batch_size-fold drop in call volume.
+    p.add_argument("--agg-probe-every", type=int, default=4,
                    dest="agg_probe_every",
                    help="Sample every Nth record_batch call for the "
-                        "call-latency proxy (bounds probe overhead)")
+                        "call-latency proxy (bounds probe overhead; "
+                        "calls are per batch per shard since write batching)")
     p.add_argument("--out", type=str, default=None,
                    help="JSON report path (default: bench/results/"
                         "sat_w{W}_l{ms}_b{B}.json)")

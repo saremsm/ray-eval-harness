@@ -145,3 +145,13 @@ class TestSaturationHarnessRealRay:
         # Mailbox-proxy latency was sampled and documented as a proxy.
         assert "proxy" in report["agg_call_latency"]["note"]
         assert report["env"]["ray_version"] == ray.__version__
+
+class TestAggProbeDefault:
+    def test_probe_every_default_matches_post_d5_call_volume(self):
+        """Pin the probe default: the probe's unit changed with batched writes from
+        one add_result call per result to one record_batch call per batch per
+        shard."""
+        from bench.saturation import build_arg_parser
+
+        ns = build_arg_parser().parse_args([])
+        assert ns.agg_probe_every == 4
