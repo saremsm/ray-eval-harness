@@ -146,6 +146,7 @@ class TestSaturationHarnessRealRay:
         assert "proxy" in report["agg_call_latency"]["note"]
         assert report["env"]["ray_version"] == ray.__version__
 
+
 class TestAggProbeDefault:
     def test_probe_every_default_matches_post_d5_call_volume(self):
         """Pin the probe default: the probe's unit changed with batched writes from
@@ -155,3 +156,74 @@ class TestAggProbeDefault:
 
         ns = build_arg_parser().parse_args([])
         assert ns.agg_probe_every == 4
+
+
+class TestSweepShardForwarding:
+    """The sweep must be able to run shard settings without filename collisions."""
+
+    def test_result_path_default_is_byte_identical_to_pre_d4b(self):
+        """Resume compatibility: an interrupted pre-shard sweep resumed with the new
+        tool must still skip its completed points."""
+        from bench.sweep_saturation import result_path
+
+        assert result_path("d", 16, 0.02, 8) == "d/sat_w16_l020_b8.json"
+        assert (
+            result_path("d", 16, 0.02, 8, 1, 1) == "d/sat_w16_l020_b8.json"
+        )
+
+    def test_result_path_shard_settings_cannot_collide(self):
+        from bench.sweep_saturation import result_path
+
+        paths = {
+            result_path("d", 256, 0.005, 64, a, dd)
+            for a in (1, 4, 8)
+            for dd in (1, 4)
+        }
+        assert len(paths) == 6, "every (a, d) setting needs its own file"
+        assert (
+            result_path("d", 256, 0.005, 64, 4, 1)
+            == "d/sat_w256_l005_b64_a4_d1.json"
+        )
+
+    def test_point_cmd_forwards_both_shard_dials(self):
+        import argparse
+
+        from bench.sweep_saturation import point_cmd
+
+        ns = argparse.Namespace(
+            fail_rate=0.1, aggregator_shards=8, decider_shards=4
+        )
+        cmd = point_cmd(ns, 128, 0.02, 8, 20000, "d/x.json")
+
+        def flag(name):
+            return cmd[cmd.index(name) + 1]
+
+        assert flag("--aggregator-shards") == "8"
+        assert flag("--decider-shards") == "4"
+        assert flag("--workers") == "128"
+        assert flag("--latency-s") == "0.02"
+        assert flag("--batch-size") == "8"
+        assert flag("--tasks") == "20000"
+        assert flag("--fail-rate") == "0.1"
+        assert flag("--out") == "d/x.json"
+
+    def test_dry_run_plans_with_shard_flags(self, tmp_path, capsys):
+        """--dry-run must print the exact per-point commands (nothing executes), and
+        every planned command carries the shard flags."""
+        from bench.sweep_saturation import main
+
+        rc = main([
+            "--dry-run",
+            "--out-dir", str(tmp_path),
+            "--aggregator-shards", "4",
+            "--decider-shards", "1",
+            "--max-workers", "64",
+        ])
+        out = capsys.readouterr().out
+        assert rc == 0
+        run_lines = [l for l in out.splitlines() if l.startswith("run: ")]
+        assert run_lines, "dry run must print the plan"
+        assert all("--aggregator-shards 4" in l for l in run_lines)
+        assert all("--decider-shards 1" in l for l in run_lines)
+        assert all("_a4_d1.json" in l for l in run_lines)
+        assert not list(tmp_path.glob("*.json")), "dry run must not run"

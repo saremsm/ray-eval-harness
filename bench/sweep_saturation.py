@@ -14,9 +14,47 @@ WORKER_COUNTS = (16, 64, 128, 256)
 BATCH_SIZES = (1, 8, 64)
 
 
-def result_path(out_dir: str, workers: int, latency_s: float, batch: int) -> str:
+def result_path(
+    out_dir: str,
+    workers: int,
+    latency_s: float,
+    batch: int,
+    aggregator_shards: int = 1,
+    decider_shards: int = 1,
+) -> str:
+    """Per-point report path."""
     ms = int(round(latency_s * 1000))
-    return os.path.join(out_dir, f"sat_w{workers}_l{ms:03d}_b{batch}.json")
+    shard_suffix = (
+        ""
+        if aggregator_shards == 1 and decider_shards == 1
+        else f"_a{aggregator_shards}_d{decider_shards}"
+    )
+    return os.path.join(
+        out_dir,
+        f"sat_w{workers}_l{ms:03d}_b{batch}{shard_suffix}.json",
+    )
+
+
+def point_cmd(
+    ns: argparse.Namespace,
+    workers: int,
+    latency_s: float,
+    batch: int,
+    n_tasks: int,
+    out: str,
+) -> list[str]:
+    """argv for one grid point."""
+    return [
+        sys.executable, "-m", "bench.saturation",
+        "--workers", str(workers),
+        "--latency-s", str(latency_s),
+        "--batch-size", str(batch),
+        "--tasks", str(n_tasks),
+        "--fail-rate", str(ns.fail_rate),
+        "--aggregator-shards", str(ns.aggregator_shards),
+        "--decider-shards", str(ns.decider_shards),
+        "--out", out,
+    ]
 
 
 def tasks_for(
@@ -41,6 +79,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-dir", type=str, default=os.path.join("bench", "results"),
                    dest="out_dir")
     p.add_argument("--fail-rate", type=float, default=0.0, dest="fail_rate")
+    p.add_argument("--aggregator-shards", type=int, default=1,
+                   dest="aggregator_shards",
+                   help="Forwarded to every point (shard sweeps). "
+                        "Use one --out-dir per setting.")
+    p.add_argument("--decider-shards", type=int, default=1,
+                   dest="decider_shards",
+                   help="Forwarded to every point; only matters when "
+                        "--fail-rate > 0. Use one --out-dir per "
+                        "setting.")
     p.add_argument("--tasks", type=int, default=None,
                    help="Fixed task count per point (default: sized from "
                         "offered load and --target-duration)")
@@ -58,7 +105,10 @@ def main(argv: list[str] | None = None) -> int:
     ran = skipped_existing = skipped_capped = failed = 0
 
     for latency_s, workers, batch in grid:
-        out = result_path(ns.out_dir, workers, latency_s, batch)
+        out = result_path(
+            ns.out_dir, workers, latency_s, batch,
+            ns.aggregator_shards, ns.decider_shards,
+        )
         if workers > ns.max_workers:
             skipped_capped += 1
             continue
@@ -68,15 +118,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         n_tasks = tasks_for(ns, workers, latency_s, batch)
-        cmd = [
-            sys.executable, "-m", "bench.saturation",
-            "--workers", str(workers),
-            "--latency-s", str(latency_s),
-            "--batch-size", str(batch),
-            "--tasks", str(n_tasks),
-            "--fail-rate", str(ns.fail_rate),
-            "--out", out,
-        ]
+        cmd = point_cmd(ns, workers, latency_s, batch, n_tasks, out)
         print(f"run: {' '.join(cmd)}")
         if ns.dry_run:
             continue
