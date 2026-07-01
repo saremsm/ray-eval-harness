@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import os
 import time
 
 import pytest
@@ -166,9 +167,12 @@ class TestSweepShardForwarding:
         tool must still skip its completed points."""
         from bench.sweep_saturation import result_path
 
-        assert result_path("d", 16, 0.02, 8) == "d/sat_w16_l020_b8.json"
+        expected = os.path.join("d", "sat_w16_l020_b8.json")
+        assert result_path("d", 16, 0.02, 8) == expected
+        assert result_path("d", 16, 0.02, 8, 1, 1) == expected
         assert (
-            result_path("d", 16, 0.02, 8, 1, 1) == "d/sat_w16_l020_b8.json"
+            os.path.basename(result_path("d", 16, 0.02, 8))
+            == "sat_w16_l020_b8.json"
         )
 
     def test_result_path_shard_settings_cannot_collide(self):
@@ -180,9 +184,8 @@ class TestSweepShardForwarding:
             for dd in (1, 4)
         }
         assert len(paths) == 6, "every (a, d) setting needs its own file"
-        assert (
-            result_path("d", 256, 0.005, 64, 4, 1)
-            == "d/sat_w256_l005_b64_a4_d1.json"
+        assert result_path("d", 256, 0.005, 64, 4, 1) == os.path.join(
+            "d", "sat_w256_l005_b64_a4_d1.json"
         )
 
     def test_point_cmd_forwards_both_shard_dials(self):

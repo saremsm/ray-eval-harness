@@ -310,6 +310,20 @@ class TestSingleShardIdentity:
         assert "aggregator_shards" not in summary
         assert summary["results_file"] == str(out)
 
+    def test_n1_passes_output_path_string_verbatim(
+        self, identity_ray_get
+    ):
+        """The N=1 shard constructor and finalize() must see the caller's exact
+        string, not a Path() round-trip of it."""
+        raw = "results/./test.jsonl"
+        created: list[_CountingShard] = []
+        facade = ShardedAggregator(
+            total_tasks=1, output_path=raw, n_shards=1,
+            aggregator_cls=_counting_cls(created),
+        )
+        assert created[0].output_path == raw
+        assert facade.finalize() == raw
+
     def test_finalize_is_a_noop_at_n1(self, tmp_path, identity_ray_get):
         out = tmp_path / "results.jsonl"
         created: list[ResultsAggregatorImpl] = []

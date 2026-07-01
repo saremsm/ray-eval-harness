@@ -295,6 +295,9 @@ class ShardedAggregator:
             raise ValueError(f"n_shards must be >= 1, got {n_shards}")
         self.total_tasks = total_tasks
         self.output_path = Path(output_path)
+        # The caller's spelling, kept verbatim for the N=1 passthrough: Path() round-
+        # trips rewrite separators on Windows (and collapse '//' or './' anywhere)
+        self._output_path_str = output_path
         self.n_shards = n_shards
         # Shared clock for merged elapsed/throughput.
         self._start_time = time.perf_counter()
@@ -302,6 +305,7 @@ class ShardedAggregator:
         if n_shards == 1:
             # Identical to the single-actor layout: one actor, the exact requested path.
             self.shard_paths = [self.output_path]
+            shard_path_strs = [self._output_path_str]
         else:
             self.shard_paths = [
                 self.output_path.with_name(
@@ -310,12 +314,13 @@ class ShardedAggregator:
                 )
                 for i in range(n_shards)
             ]
+            shard_path_strs = [str(path) for path in self.shard_paths]
         # total_tasks is passed whole to every shard: it only feeds the
         self._shards = [
             aggregator_cls.remote(
-                total_tasks=total_tasks, output_path=str(path)
+                total_tasks=total_tasks, output_path=path_str
             )
-            for path in self.shard_paths
+            for path_str in shard_path_strs
         ]
 
     def shard_for(self, task_id: str) -> int:
@@ -359,7 +364,7 @@ class ShardedAggregator:
     def finalize(self) -> str:
         """Seal writes and materialise the single results file."""
         if self.n_shards == 1:
-            return str(self.output_path)
+            return self._output_path_str
         ray.get([shard.close.remote() for shard in self._shards])
         existing = [p for p in self.shard_paths if p.exists()]
         if existing:
