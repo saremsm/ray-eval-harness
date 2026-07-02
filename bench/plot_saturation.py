@@ -35,28 +35,42 @@ def load_reports(paths: list[str]) -> list[dict]:
     return reports
 
 
-def curve_label(batch: int, fail_rate: float) -> str:
-    return (
-        f"batch={batch}"
-        if fail_rate == 0.0
-        else f"batch={batch} fail={fail_rate:g}"
-    )
+def curve_label(
+    batch: int,
+    fail_rate: float,
+    agg_shards: int = 1,
+    dec_shards: int = 1,
+) -> str:
+    label = f"batch={batch}"
+    if fail_rate != 0.0:
+        label += f" fail={fail_rate:g}"
+    # Shard settings only appear when they differ from the single-actor default.
+    if agg_shards != 1:
+        label += f" agg={agg_shards}"
+    if dec_shards != 1:
+        label += f" dec={dec_shards}"
+    return label
 
 
 def curves_by_batch(
     reports: list[dict],
-) -> dict[tuple[int, float], list[tuple[float, float]]]:
-    """(batch_size, fail_rate) -> [(offered, achieved)] sorted by offered. Runs with
-    different fail rates are different experiments and get separate curves."""
+) -> dict[tuple[int, float, int, int], list[tuple[float, float]]]:
+    """(batch_size, fail_rate, aggregator_shards, decider_shards) -> [(offered,
+    achieved)] sorted by offered. Settings are read from each report's recorded
+    args, never from filenames; reports that predate the flags key as (.., 1, 1)."""
     curves: dict[
-        tuple[int, float], list[tuple[float, float]]
+        tuple[int, float, int, int], list[tuple[float, float]]
     ] = defaultdict(list)
     for r in reports:
         batch = int(r["args"]["batch_size"])
         fail_rate = float(r["args"].get("fail_rate", 0.0))
+        agg_shards = int(r["args"].get("aggregator_shards", 1))
+        dec_shards = int(r["args"].get("decider_shards", 1))
         offered = float(r["offered_load_tasks_per_s"])
         achieved = float(r["achieved"]["throughput_tasks_per_s_wall"])
-        curves[(batch, fail_rate)].append((offered, achieved))
+        curves[(batch, fail_rate, agg_shards, dec_shards)].append(
+            (offered, achieved)
+        )
     for key in curves:
         curves[key].sort()
     return dict(sorted(curves.items()))
@@ -64,9 +78,9 @@ def curves_by_batch(
 
 def analyze(
     label: str,
-    curves: dict[tuple[int, float], list[tuple[float, float]]],
+    curves: dict[tuple, list[tuple[float, float]]],
 ) -> None:
-    for (batch, fail_rate), points in curves.items():
+    for key, points in curves.items():
         knee_i = next(
             (
                 i
@@ -98,7 +112,7 @@ def analyze(
                     f"{recross:.1f}; knee is marginal]"
                 )
         print(
-            f"[{label}] {curve_label(batch, fail_rate)}: {knee_txt}; "
+            f"[{label}] {curve_label(*key)}: {knee_txt}; "
             f"max achieved {max_achieved:.1f} tasks/s "
             f"over {len(points)} points"
         )
@@ -106,7 +120,7 @@ def analyze(
 
 def plot(
     datasets: list[
-        tuple[str, dict[tuple[int, float], list[tuple[float, float]]]]
+        tuple[str, dict[tuple, list[tuple[float, float]]]]
     ],
     out: str,
 ) -> None:
@@ -120,11 +134,11 @@ def plot(
     all_offered: list[float] = []
     for i, (label, curves) in enumerate(datasets):
         style = linestyles[i % len(linestyles)]
-        for (batch, fail_rate), points in curves.items():
+        for key, points in curves.items():
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
             all_offered.extend(xs)
-            base = curve_label(batch, fail_rate)
+            base = curve_label(*key)
             name = base if len(datasets) == 1 else f"{label} {base}"
             ax.plot(xs, ys, style, marker="o", label=name)
     if all_offered:
@@ -154,9 +168,10 @@ def main(argv: list[str] | None = None) -> None:
                    default=[os.path.join("bench", "results")],
                    help="Report files or directories "
                         "(default: bench/results/)")
-    p.add_argument("--compare", nargs=2, metavar=("A", "B"), default=None,
-                   help="Overlay two result sets (files or directories); "
-                        "for before/after comparisons (shard sweep)")
+    p.add_argument("--compare", nargs="+", metavar="PATH", default=None,
+                   help="Overlay two or more result sets (files or "
+                        "directories); for before/after and shard-sweep "
+                        "overlays (shard sweeps)")
     p.add_argument("--out", type=str,
                    default=os.path.join("bench", "results", "saturation.png"))
     p.add_argument("--no-plot", action="store_true", dest="no_plot",
@@ -164,12 +179,12 @@ def main(argv: list[str] | None = None) -> None:
     ns = p.parse_args(argv)
 
     if ns.compare:
-        a, b = ns.compare
+        if len(ns.compare) < 2:
+            p.error("--compare needs at least two paths")
         datasets = [
-            (os.path.basename(a.rstrip("/")) or a,
-             curves_by_batch(load_reports([a]))),
-            (os.path.basename(b.rstrip("/")) or b,
-             curves_by_batch(load_reports([b]))),
+            (os.path.basename(path.rstrip("/")) or path,
+             curves_by_batch(load_reports([path])))
+            for path in ns.compare
         ]
     else:
         datasets = [("results", curves_by_batch(load_reports(ns.paths)))]

@@ -262,9 +262,13 @@ def main() -> None:
         dest="aggregator_shards",
         help=(
             "Number of ResultsAggregator shard actors, keyed by a "
-            "stable hash of task_id. Default: 1 (single actor, the "
-            "pre-shard behavior) until the shard sweep sweep measures a better "
-            "value. With N > 1, per-shard JSONLs are written next to "
+            "stable hash of task_id. Default: 1 - the measured best "
+            "(bench/results/SHARDED.md): with batched "
+            "record_batch the single actor keeps up, and every extra "
+            "shard adds one actor call per shard touched per batch to "
+            "the single-threaded driver loop (b=8 ceiling 17.8k -> "
+            "9.5k -> 6.4k tasks/s at 1/4/8 shards). "
+            "With N > 1, per-shard JSONLs are written next to "
             "--output as <stem>.shardK.jsonl and concatenated into "
             "--output at end of run; the concatenated file contains "
             "every result exactly once but is NOT globally ordered "

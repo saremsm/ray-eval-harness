@@ -1,9 +1,11 @@
 """Unit tests for bench/plot_saturation.py. 2. Curves are keyed by (batch_size,
 fail_rate) so fault-injected runs never merge into clean curves - merged, they
-produce a knee that belongs to neither experiment."""
+produce a knee that belongs to neither experiment. 4."""
 
 import json
 import os
+
+import pytest
 
 from bench.plot_saturation import (
     KNEE_RATIO,
@@ -12,6 +14,7 @@ from bench.plot_saturation import (
     curves_by_batch,
     load_reports,
 )
+from bench.plot_saturation import main as plot_main
 
 
 def write_report(
@@ -22,6 +25,8 @@ def write_report(
     achieved: float,
     fail_rate: float = 0.0,
     workers: int = 8,
+    agg_shards: int = 1,
+    dec_shards: int = 1,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     report = {
@@ -29,6 +34,8 @@ def write_report(
             "workers": workers,
             "batch_size": batch,
             "fail_rate": fail_rate,
+            "aggregator_shards": agg_shards,
+            "decider_shards": dec_shards,
         },
         "offered_load_tasks_per_s": offered,
         "achieved": {"throughput_tasks_per_s_wall": achieved},
@@ -85,9 +92,9 @@ class TestFailRateSeparation:
             batch=8, offered=6400.0, achieved=3658.0, fail_rate=0.1,
         )
         curves = curves_by_batch(load_reports([str(tmp_path)]))
-        assert set(curves) == {(8, 0.0), (8, 0.1)}
-        assert curves[(8, 0.0)] == [(6400.0, 4911.0)]
-        assert curves[(8, 0.1)] == [(6400.0, 3658.0)]
+        assert set(curves) == {(8, 0.0, 1, 1), (8, 0.1, 1, 1)}
+        assert curves[(8, 0.0, 1, 1)] == [(6400.0, 4911.0)]
+        assert curves[(8, 0.1, 1, 1)] == [(6400.0, 3658.0)]
 
     def test_missing_fail_rate_defaults_to_clean(self, tmp_path):
         p = str(tmp_path / "old.json")
@@ -95,14 +102,93 @@ class TestFailRateSeparation:
         with open(p, "r", encoding="utf-8") as fh:
             r = json.load(fh)
         del r["args"]["fail_rate"]
+        del r["args"]["aggregator_shards"]
+        del r["args"]["decider_shards"]
         with open(p, "w", encoding="utf-8") as fh:
             json.dump(r, fh)
         curves = curves_by_batch(load_reports([p]))
-        assert set(curves) == {(1, 0.0)}
+        # Older reports lack the shard args and key as (1, 1).
+        assert set(curves) == {(1, 0.0, 1, 1)}
 
     def test_curve_label(self):
         assert curve_label(8, 0.0) == "batch=8"
         assert curve_label(8, 0.1) == "batch=8 fail=0.1"
+        # Shard settings appear only when they differ from the default.
+        assert curve_label(8, 0.0, 1, 1) == "batch=8"
+        assert curve_label(8, 0.0, 4, 1) == "batch=8 agg=4"
+        assert curve_label(8, 0.0, 1, 4) == "batch=8 dec=4"
+        assert curve_label(8, 0.1, 8, 4) == "batch=8 fail=0.1 agg=8 dec=4"
+
+
+class TestShardSettingSeparation:
+    def test_shard_settings_form_separate_curves(self, tmp_path):
+        # One tree holding an a1 and an a4 sweep (the sweep layout) must yield one
+        write_report(
+            str(tmp_path / "a1" / "rep1" / "x.json"),
+            batch=8, offered=25600.0, achieved=17785.0, agg_shards=1,
+        )
+        write_report(
+            str(tmp_path / "a4" / "rep1" / "x.json"),
+            batch=8, offered=25600.0, achieved=9482.0, agg_shards=4,
+        )
+        curves = curves_by_batch(load_reports([str(tmp_path)]))
+        assert set(curves) == {(8, 0.0, 1, 1), (8, 0.0, 4, 1)}
+        assert curves[(8, 0.0, 1, 1)] == [(25600.0, 17785.0)]
+        assert curves[(8, 0.0, 4, 1)] == [(25600.0, 9482.0)]
+
+    def test_decider_shards_also_key(self, tmp_path):
+        write_report(
+            str(tmp_path / "d1.json"),
+            batch=8, offered=100.0, achieved=90.0,
+            fail_rate=0.1, dec_shards=1,
+        )
+        write_report(
+            str(tmp_path / "d4.json"),
+            batch=8, offered=100.0, achieved=90.0,
+            fail_rate=0.1, dec_shards=4,
+        )
+        curves = curves_by_batch(load_reports([str(tmp_path)]))
+        assert set(curves) == {(8, 0.1, 1, 1), (8, 0.1, 1, 4)}
+
+    def test_sharded_curve_labeled_in_analyze_output(self, capsys):
+        curves = {(8, 0.0, 4, 1): [(25600.0, 9482.0)]}
+        analyze("t", curves)
+        out = capsys.readouterr().out
+        assert "batch=8 agg=4" in out
+
+
+class TestCompareMultiway:
+    def _tree(self, tmp_path, name, achieved, agg_shards):
+        write_report(
+            str(tmp_path / name / "x.json"),
+            batch=8, offered=25600.0, achieved=achieved,
+            agg_shards=agg_shards,
+        )
+        return str(tmp_path / name)
+
+    def test_compare_accepts_three_paths(self, tmp_path, capsys):
+        a1 = self._tree(tmp_path, "a1", 17785.0, 1)
+        a4 = self._tree(tmp_path, "a4", 9482.0, 4)
+        a8 = self._tree(tmp_path, "a8", 6407.0, 8)
+        plot_main(["--compare", a1, a4, a8, "--no-plot"])
+        out = capsys.readouterr().out
+        assert "[a1] batch=8:" in out
+        assert "[a4] batch=8 agg=4:" in out
+        assert "[a8] batch=8 agg=8:" in out
+
+    def test_compare_still_works_with_two_paths(self, tmp_path, capsys):
+        a = self._tree(tmp_path, "before", 17785.0, 1)
+        b = self._tree(tmp_path, "after", 9482.0, 4)
+        plot_main(["--compare", a, b, "--no-plot"])
+        out = capsys.readouterr().out
+        assert "[before]" in out
+        assert "[after]" in out
+
+    def test_compare_rejects_single_path(self, tmp_path, capsys):
+        a = self._tree(tmp_path, "only", 17785.0, 1)
+        with pytest.raises(SystemExit):
+            plot_main(["--compare", a, "--no-plot"])
+        assert "at least two paths" in capsys.readouterr().err
 
 
 class TestKneeAnalysis:

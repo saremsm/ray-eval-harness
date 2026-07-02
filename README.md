@@ -89,7 +89,7 @@ The derived value is logged at startup and reported in the summary as `hang_thre
 
 **Tuples in `pending`.** Retries re-append to `pending`, and a re-queued batch needs to remember how many times it's been tried. Keeping the count in the tuple means the budget is enforced on every retry path, including hangs.
 
-**Sharded aggregator behind a plain-Python facade, writes as fire-and-forget.** Concurrent JSONL writing stays "call a method on an actor" - Ray serializes actor methods for free, no `fcntl`, no threading lock - but batched writes puts a driver-side `ShardedAggregator` facade in front of N `ResultsAggregator` actors, routed by `crc32(task_id) % N` (deliberately not the builtin `hash()`, which is salted per process and would make routing non-reproducible). `record_batch` issues ONE actor call per shard touched per completed batch, never one per result - the overlay finding was that the per-result submit path is the harness ceiling. The coordinator doesn't block on writes; the refs are drained at end of run, then `finalize()` concatenates the per-shard JSONLs into `--output` (every result exactly once, grouped by shard in per-shard completion order - the file is **not** globally ordered) and `get_summary()` merges: counters and sums added, min/max taken across shards, condition scores pooled, latency reservoirs concatenated, elapsed/throughput from the facade's shared start time. Each shard keeps a uniform latency reservoir capped at M = 100,000 samples, so latency *percentiles* are approximate once a shard exceeds M succeeded results (means and counts stay exact - they use running sums). `--aggregator-shards` defaults to 1 - a strict passthrough that is behaviorally identical to the pre-shard single actor, pinned by test - until the shard sweep sweep measures a better value.
+**Sharded aggregator behind a plain-Python facade, writes as fire-and-forget.** Concurrent JSONL writing stays "call a method on an actor" - Ray serializes actor methods for free, no `fcntl`, no threading lock - but batched writes puts a driver-side `ShardedAggregator` facade in front of N `ResultsAggregator` actors, routed by `crc32(task_id) % N` (deliberately not the builtin `hash()`, which is salted per process and would make routing non-reproducible). `record_batch` issues ONE actor call per shard touched per completed batch, never one per result - the overlay finding was that the per-result submit path is the harness ceiling. The coordinator doesn't block on writes; the refs are drained at end of run, then `finalize()` concatenates the per-shard JSONLs into `--output` (every result exactly once, grouped by shard in per-shard completion order - the file is **not** globally ordered) and `get_summary()` merges: counters and sums added, min/max taken across shards, condition scores pooled, latency reservoirs concatenated, elapsed/throughput from the facade's shared start time. Each shard keeps a uniform latency reservoir capped at M = 100,000 samples, so latency *percentiles* are approximate once a shard exceeds M succeeded results (means and counts stay exact - they use running sums). `--aggregator-shards` defaults to 1 - a strict passthrough that is behaviorally identical to the pre-shard single actor, pinned by test - and the shard sweep sweep measured 1 as the best value: with batched writes the single actor keeps up, and every extra shard adds driver-side submit calls (see "Measured shard sweep (shard sweep)" below).
 
 **Shared `FailureDecider` actor for deterministic injection.** The naive design - each worker holds its own seeded RNG - gives reproducible *per-worker* sequences but not reproducible *task-level* failures, because Ray's scheduler routes batches non-deterministically. A single decider actor that all fault-injecting workers query makes failure a function of `(seed, batch_content, attempt_number)` rather than which worker happened to receive the batch. decider sharding shards this behind a `ShardedFailureDecider` facade (`--decider-shards`, default 1) without touching that guarantee: the decision is a pure function of `(seed, batch_key, attempt, failure_rate)`, every shard gets the same seed, and routing hashes the batch key *only* - so each key's attempt counter lives whole on one shard and the failure sequence at any shard count is identical to the single actor's (pinned by a 500-batch N=1-vs-N=4 equality test). The facade duck-types the actor-handle surface (`should_fail.remote(...)`), so the fault-injecting workers take it through the same `decider=` kwarg unchanged.
 
@@ -220,7 +220,8 @@ python -m bench.saturation --workers 128 --latency-s 0.02 --batch-size 8 \
     --tasks 200000 --fail-rate 0.0 --out bench/results/sat_w128_l020_b8.json
 python -m bench.sweep_saturation --max-workers 128
 python -m bench.plot_saturation                 # curves + knees
-python -m bench.plot_saturation --compare before/ after/   # the shard sweep overlays
+python -m bench.plot_saturation --compare before/ after/       # 2-way overlay
+python -m bench.plot_saturation --compare a1/ a4/ a8/          # the shard sweep shard overlay
 ```
 
 **Why completions/sec on the x-axis, not GPU count.** The coordinator never
@@ -297,6 +298,39 @@ driver loop + aggregator actor on one box - not cluster-scale throughput.
 That is by design: the coordinator is the component that saturates first,
 and completions/sec makes the ceiling portable to any fleet size.
 
+### Measured shard sweep (shard sweep)
+
+Same box and grid as the baseline, run **after** batched writes's batched
+`record_batch` writes, at `--aggregator-shards` 1 / 4 / 8 (3 reps / 1 /
+1). Raw reports: `bench-results-sharded/`; full analysis:
+`bench/results/SHARDED.md`; overlay plot (both the post-batched-writes single-shard
+curves and the sharded curves on one figure, from
+`python -m bench.plot_saturation --compare bench-results-sharded/a1
+bench-results-sharded/a4 bench-results-sharded/a8 --out
+bench/results/sharded_overlay.png`):
+
+![Shard-sweep overlay: a1 vs a4 vs a8](bench/results/sharded_overlay.png)
+
+| batch | shards=1 ceiling / knee | shards=4 | shards=8 |
+|-------|-------------------------|----------|----------|
+| 1     | 2,568/s at knee ~2,560  | 2,516/s, ~2,560 | 2,474/s, ~2,560 |
+| 8     | 17,785/s, knee ~20,480  | 9,482/s, ~10,240 | 6,407/s, ~6,400 |
+| 64    | 65,625/s, knee ~32,768 (marginal) | 47,522/s, ~32,768 | 34,624/s, ~32,768 |
+
+(Ceilings are best grid-point means; the shards=1 curve already sits
+3.6-13x above the baseline because batched writes landed in between - the baseline
+`add_result` bottleneck is gone at every shard count.)
+
+Sharding the aggregator makes throughput strictly worse - the batch=8
+ceiling drops 47%/64% and the knee halves twice - because after batched writes the
+single actor keeps up (mailbox proxy p99 <= ~0.3 s vs 15-17 s in the baseline)
+while each extra shard adds one `record_batch` call per shard touched
+per batch to the single-threaded driver loop, whose `agg_submit` share
+at the batch=8 ceiling point grows 36% -> 65% -> 74%. The default
+therefore stays `--aggregator-shards 1`, and the next component to
+saturate is the driver loop itself, now roughly evenly split between
+dispatch and result submission with no actor backed up behind it.
+
 ## Reproducibility
 
 Both backends use greedy decoding (`temperature=0.0` on vLLM; the HF text-generation pipeline defaults to `do_sample=False`). Outputs are **empirically stable across runs** (table below), but greedy decoding under continuous batching is not *guaranteed* bitwise-deterministic: batch composition changes kernel shapes and reduction orders, and composition varies with retry timing (backoff jitter deliberately uses an unseeded RNG). Failure *decisions* are fully deterministic; wall-clock scheduling is not.
@@ -338,7 +372,7 @@ And the items in **Bugs found and fixed** above - most notably the unkilled-acto
 These are real and worth knowing about; none are showstoppers.
 
 - **Whole-batch retry on partial failure.** When one task in a batch fails, the entire batch is re-queued. At vLLM batch sizes (64+), this re-runs many successful generations to recover one failure. Per-task retry, or splitting a failed batch in half on retry, would be the natural improvements.
-- **Aggregator sharding exists but ships unmeasured, and it costs global order.** `--aggregator-shards N` fans results out to N `ResultsAggregator` actors keyed by `crc32(task_id) % N`; the default stays 1 (identical to the old single actor) until the shard sweep sweep measures where the knee actually moves. With N > 1 the concatenated `results.jsonl` is no longer globally ordered (grouped by shard, per-shard completion order - re-sort by `task_id` if you need determinism), and latency percentiles in the merged summary are approximate once any shard exceeds its M = 100,000-sample reservoir (means/counts stay exact). The `FailureDecider` got the same treatment in decider sharding (`--decider-shards`, key-hash routing, provably outcome-identical at any shard count) - but like the aggregator it ships unmeasured at default 1, and the per-batch attempt maps are still unbounded *per shard*: sharding divides the memory across N actors without capping it, so long fault-heavy runs still want eviction of keys whose batches reached a terminal state. That piece remains unbuilt.
+- **Aggregator sharding is measured, slower, and it costs global order.** `--aggregator-shards N` fans results out to N `ResultsAggregator` actors keyed by `crc32(task_id) % N`; the shard sweep sweep (`bench/results/SHARDED.md`) measured N=4/8 strictly worse than 1 with batched writes (batch=8 ceiling 17.8k -> 9.5k -> 6.4k tasks/s), so the default stays 1 - now as the measured best rather than a placeholder. The flag remains for re-measurement if a future change makes the aggregator actor the bottleneck again. With N > 1 the concatenated `results.jsonl` is no longer globally ordered (grouped by shard, per-shard completion order - re-sort by `task_id` if you need determinism), and latency percentiles in the merged summary are approximate once any shard exceeds its M = 100,000-sample reservoir (means/counts stay exact). The `FailureDecider` got the same treatment in decider sharding (`--decider-shards`, key-hash routing, provably outcome-identical at any shard count) - but unlike the aggregator it is still unmeasured at default 1 (the shard sweep faulted decider row was not run), and the per-batch attempt maps are still unbounded *per shard*: sharding divides the memory across N actors without capping it, so long fault-heavy runs still want eviction of keys whose batches reached a terminal state. That piece remains unbuilt.
 - **Worker replacement blocks the scheduling loop.** The old actor is now killed immediately and the slot marked dead first, but constructing the replacement still blocks on model load - minutes at 70B scale - during which completed refs from healthy workers sit unharvested. A standby pool (workers pre-loaded and idle) or backgrounded replacement would make it O(1); neither is built.
 - **`tokens_generated` is left at 0 on the HF batch path.** Reported accurately on the hooked path (counted from criterion calls) and on vLLM batch (from `len(token_ids)`). Re-tokenizing the response string round-trips through BPE merges and isn't guaranteed to match the generated count, so the field stays unset rather than reporting a wrong number. Plumbing token IDs out of the HF pipeline is the proper fix.
 - **`tensor_parallel_size > 1` is wired through but only verified at `tp=1`.** The coordinator passes `tp` to both initial creation and worker replacement, the actor's `@ray.remote(num_gpus=tp)` claim follows from it, but a real multi-GPU run also wants `STRICT_PACK` placement groups for colocation; that piece isn't built. Single-GPU and CPU paths are exercised end-to-end on real hardware; multi-GPU and multi-node are designed-in but not run in anger.

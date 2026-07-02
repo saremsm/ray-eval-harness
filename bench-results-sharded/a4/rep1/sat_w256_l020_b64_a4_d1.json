@@ -1,0 +1,225 @@
+{
+  "args": {
+    "workers": 256,
+    "latency_s": 0.02,
+    "batch_size": 64,
+    "tasks": 200000,
+    "fail_rate": 0.0,
+    "jitter": 0.1,
+    "seed": 0,
+    "aggregator_shards": 4,
+    "decider_shards": 1,
+    "agg_probe_every": 4,
+    "out": "bench/results/sharded/a4/rep1/sat_w256_l020_b64_a4_d1.json"
+  },
+  "env": {
+    "ray_version": "2.50.0",
+    "cpu_count": 32,
+    "python": "3.12.3"
+  },
+  "offered_load_tasks_per_s": 819200.0,
+  "achieved": {
+    "tasks_recorded": 200000,
+    "succeeded": 200000,
+    "failed": 0,
+    "wall_time_s": 8.003066314002353,
+    "throughput_tasks_per_s_wall": 24990.421440101687,
+    "throughput_tasks_per_s_aggregator": 41418.32176222589
+  },
+  "saturated": true,
+  "loop": {
+    "iterations": 3125,
+    "span_s": 4.461757321998448,
+    "iterations_per_s": 700.3966765723362
+  },
+  "steady_state": {
+    "window_definition": "middle 60% of the loop_iter span",
+    "window_s": 2.6770543931961583,
+    "loop_duty_cycle": 0.9993333997038092,
+    "timer_totals_s": {
+      "loop_iter": 2.675269867944735,
+      "ray_wait": 0.16114217796348385,
+      "dispatch": 0.5910001030060812,
+      "agg_submit": 1.34230492806455
+    },
+    "share_of_loop_iter": {
+      "ray_wait": 0.060233989809514304,
+      "dispatch": 0.22091233115861864,
+      "agg_submit": 0.5017456160771437,
+      "unaccounted": 0.2171080629547233
+    }
+  },
+  "agg_call_latency": {
+    "note": "record_batch submit-to-ready latency measured coordinator-side; Ray exposes no actor mailbox depth, so FIFO call latency is the proxy for aggregator queue depth (one sample = one shard call, not one result)",
+    "probe_every_nth_call": 4,
+    "samples": 3125,
+    "p50_s": 0.000994877002085559,
+    "p90_s": 0.0013752169979852624,
+    "p99_s": 0.26214988399806316,
+    "max_s": 0.2822048679990985
+  },
+  "gauges": {
+    "interval_s": 0.5,
+    "series": {
+      "pending": [
+        [
+          0.0,
+          2541.0
+        ],
+        [
+          0.5,
+          2169.0
+        ],
+        [
+          1.0,
+          1823.0
+        ],
+        [
+          1.5,
+          1546.0
+        ],
+        [
+          2.0,
+          1204.0
+        ],
+        [
+          2.5,
+          843.0
+        ],
+        [
+          3.0,
+          477.0
+        ],
+        [
+          3.5,
+          142.0
+        ],
+        [
+          4.0,
+          0.0
+        ]
+      ],
+      "active": [
+        [
+          0.0,
+          256.0
+        ],
+        [
+          0.5,
+          256.0
+        ],
+        [
+          1.0,
+          256.0
+        ],
+        [
+          1.5,
+          256.0
+        ],
+        [
+          2.0,
+          256.0
+        ],
+        [
+          2.5,
+          256.0
+        ],
+        [
+          3.0,
+          256.0
+        ],
+        [
+          3.5,
+          256.0
+        ],
+        [
+          4.0,
+          1.0
+        ]
+      ],
+      "deferred": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.5,
+          0.0
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.5,
+          0.0
+        ],
+        [
+          2.0,
+          0.0
+        ],
+        [
+          2.5,
+          0.0
+        ],
+        [
+          3.0,
+          0.0
+        ],
+        [
+          3.5,
+          0.0
+        ],
+        [
+          4.0,
+          0.0
+        ]
+      ],
+      "standby": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.5,
+          0.0
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.5,
+          0.0
+        ],
+        [
+          2.0,
+          0.0
+        ],
+        [
+          2.5,
+          0.0
+        ],
+        [
+          3.0,
+          0.0
+        ],
+        [
+          3.5,
+          0.0
+        ],
+        [
+          4.0,
+          0.0
+        ]
+      ]
+    }
+  },
+  "counts": {
+    "completed": 200000,
+    "failed": 0,
+    "retried": 0,
+    "replaced": 0
+  },
+  "results_jsonl": "/tmp/sat_bench_ya30wr8l/results.jsonl"
+}
