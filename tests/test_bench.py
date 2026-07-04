@@ -138,7 +138,7 @@ class TestSaturationHarnessRealRay:
         totals = report["steady_state"]["timer_totals_s"]
         for name in ("loop_iter", "ray_wait", "dispatch", "agg_submit"):
             assert name in totals
-        # Gauge series exist, standby pinned at 0 (no standby pool yet).
+        # Gauge series exist; the bench runs with the default --standby 0.
         series = report["gauges"]["series"]
         for name in ("pending", "active", "deferred", "standby"):
             assert series[name], f"gauge series {name!r} empty"

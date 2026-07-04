@@ -601,11 +601,15 @@ class _FakeBackendActor:
         worker_id: int,
         plan: list[str] | None = None,
         delay: float = 0.0,
+        health_delay: float = 0.0,
         **_unused,
     ) -> None:
         self.worker_id = worker_id
         self._plan = list(plan) if plan else []
         self._delay = delay
+        # Deferred-readiness modeling: the health_check ref resolves only after
+        # health_delay seconds.
+        self._health_delay = health_delay
         self.completed = 0
         self.failed = 0
         self.poisoned = False
@@ -648,7 +652,7 @@ class _FakeBackendActor:
     def health_check(self):
         def _fn() -> bool:
             return not self.poisoned
-        return _FakeActorMethod(_fn, delay=0.0)
+        return _FakeActorMethod(_fn, delay=self._health_delay)
 
     @property
     def get_stats(self):
@@ -709,17 +713,33 @@ def _coordinator_with_fake_workers(
     delay: float = 0.0,
     batch_size: int = 4,
     aggregator_shards: int = 1,
+    standby: int = 0,
+    refill_health_delay: float = 0.0,
 ) -> tuple[DistributedEvalCoordinator, list[EvalTask]]:
     """Build coordinator wired to fake workers and a fake aggregator."""
     n_workers = len(plan_per_worker)
+    n_initial = n_workers + standby
     plan_queue = deque(plan_per_worker)
 
     class _BackendStub:
+        created: list[_FakeBackendActor] = []
+
         @staticmethod
         def remote(**kwargs):
             plan = plan_queue.popleft() if plan_queue else None
-            return _FakeBackendActor(plan=plan, delay=delay, **kwargs)
-        
+            is_refill = (
+                kwargs.get("worker_id", 0) >= n_workers
+                and len(_BackendStub.created) >= n_initial
+            )
+            actor = _FakeBackendActor(
+                plan=plan,
+                delay=delay,
+                health_delay=refill_health_delay if is_refill else 0.0,
+                **kwargs,
+            )
+            _BackendStub.created.append(actor)
+            return actor
+
         @staticmethod
         def options(**_kwargs):
             return _BackendStub  # ignore num_gpus etc. in tests
@@ -735,8 +755,10 @@ def _coordinator_with_fake_workers(
         aggregator_cls=_FakeAggregator,
         aggregator_shards=aggregator_shards,
         worker_cls=_BackendStub,
+        standby=standby,
     )
-    
+    coord._test_worker_stub = _BackendStub
+
     tasks = [make_task(f"t{i:03d}") for i in range(n_tasks)]
     return coord, tasks
 
@@ -833,6 +855,20 @@ class TestCoordinatorIntegration:
         assert kill_mock.call_args[1].get("no_restart") is True
         assert summary["succeeded"] == 8
 
+        # standby=0 default: blocking path, today's behavior.
+        created = coord._test_worker_stub.created
+        assert len(created) == 3, (
+            "2 primaries + 1 synchronously constructed (blocking) "
+            f"replacement expected at standby=0; got {len(created)}"
+        )
+        sb = summary["standby"]
+        assert sb["configured"] == 0
+        assert sb["promotions"] == 0
+        assert sb["refills_started"] == 0
+        assert sb["fallbacks"] == 0, (
+            "standby=0 is today's behavior, not a pool fallback"
+        )
+
     def test_run_terminates_when_all_workers_die(self, patched_ray, monkeypatch):
         """If every worker fails replacement, run() must terminate rather than spinning forever."""
         # Both workers poison on first call, and replacement always fails.
@@ -855,6 +891,172 @@ class TestCoordinatorIntegration:
         )
         assert summary["failed"] == 8
         assert summary["succeeded"] == 0
+
+
+class TestStandbyPool:
+    """Pre-loaded standby workers make replacement an O(1) handle swap."""
+
+    def test_ctor_default_is_zero(self):
+        coord = make_coordinator()
+        assert coord.standby == 0
+
+    def test_ctor_rejects_negative_standby(self):
+        with pytest.raises(ValueError, match="standby"):
+            make_coordinator(standby=-1)
+
+    def test_startup_creates_standby_pool(self, patched_ray):
+        """--standby N builds N extra workers from the same factory at startup; a
+        clean run never touches them."""
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["ok"] * 8, ["ok"] * 8],
+            n_tasks=8,
+            standby=2,
+        )
+        summary = coord.run(tasks)
+        assert summary["succeeded"] == 8
+
+        created = coord._test_worker_stub.created
+        assert len(created) == 4, "2 primaries + 2 standbys"
+        # Standby worker_ids continue past the slot ids.
+        assert [a.worker_id for a in created] == [0, 1, 2, 3]
+        # Standbys stayed idle on a clean run.
+        assert created[2].completed == 0 and created[3].completed == 0
+
+        sb = summary["standby"]
+        assert sb["configured"] == 2
+        assert sb["promotions"] == 0
+        assert sb["refills_started"] == 0
+        assert sb["fallbacks"] == 0
+        assert sb["final_pool_size"] == 2
+        # Pool size over time: one startup sample at size 2, no changes.
+        assert [size for _, size in sb["pool_timeline"]] == [2]
+
+    def test_promotion_never_calls_the_blocking_creator(
+        self, patched_ray, monkeypatch
+    ):
+        """With a ready standby, replacement must be a handle swap: the blocking
+        construct-and-wait path must not run at all, and the promoted worker must
+        receive the pending (retried) batch through the existing dispatch path."""
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["poison"], ["ok"] * 20],
+            n_tasks=8,
+            max_retries=2,
+            standby=1,
+        )
+
+        def _forbidden(*_a, **_k):
+            raise AssertionError(
+                "blocking replacement ran despite a ready standby"
+            )
+
+        monkeypatch.setattr(coord, "_blocking_replace", _forbidden)
+        summary = coord.run(tasks)
+
+        assert summary["succeeded"] == 8
+        sb = summary["standby"]
+        assert sb["promotions"] == 1
+        assert sb["fallbacks"] == 0
+
+        created = coord._test_worker_stub.created
+        # 2 primaries + 1 standby + 1 async refill; nothing else.
+        assert len(created) == 4
+        promoted = created[2]  # the startup standby (worker_id 2)
+        assert promoted.completed > 0, (
+            "The promoted standby must receive the re-queued batch "
+            "through the normal dispatch path"
+        )
+
+    def test_refill_completes_on_a_later_loop_iteration(self, patched_ray):
+        """After a promotion, the coordinator submits a replacement standby
+        asynchronously and polls its readiness ping with ray.wait(timeout=0)"""
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["poison"], ["ok"] * 30],
+            n_tasks=24,
+            max_retries=2,
+            batch_size=4,
+            delay=0.05,               # keeps the loop alive past the refill
+            standby=1,
+            refill_health_delay=0.05,
+        )
+        summary = coord.run(tasks)
+        assert summary["succeeded"] == 24
+
+        sb = summary["standby"]
+        assert sb["promotions"] == 1
+        assert sb["refills_started"] == 1
+        assert sb["refills_completed"] == 1, (
+            "The refill's readiness ping resolved during the run and "
+            "must have been harvested by the non-blocking poll"
+        )
+        assert sb["refill_failures"] == 0
+        assert sb["final_pool_size"] == 1
+        # Pool size over time: 1 at startup -> 0 on promotion -> 1 on refill
+        assert [size for _, size in sb["pool_timeline"]] == [1, 0, 1]
+        # The refill became ready strictly after the promotion drained the pool.
+        t_drain = sb["pool_timeline"][1][0]
+        t_refill = sb["pool_timeline"][2][0]
+        assert t_refill > t_drain
+
+    def test_empty_pool_falls_back_to_blocking(self, patched_ray, caplog):
+        """Two replacements, one standby, refill too slow: the second replacement
+        finds the pool empty and must fall back to today's blocking path - and
+        log that it did."""
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["poison"], ["poison"]],
+            n_tasks=8,
+            max_retries=2,
+            standby=1,
+            refill_health_delay=30.0,  # never ready within this run
+        )
+        with caplog.at_level("WARNING"):
+            summary = coord.run(tasks)
+
+        assert summary["succeeded"] == 8
+        sb = summary["standby"]
+        assert sb["promotions"] == 1
+        assert sb["fallbacks"] == 1
+        assert sb["refills_started"] == 1
+        assert sb["refills_completed"] == 0
+        assert sb["refills_in_flight_at_exit"] == 1
+        assert any(
+            "falling back to blocking replacement" in rec.message
+            for rec in caplog.records
+        ), "Empty-pool fallback must be logged"
+
+        created = coord._test_worker_stub.created
+        # 2 primaries + 1 standby + 1 refill + 1 blocking replacement.
+        assert len(created) == 5
+
+    def test_promotion_slot_bookkeeping(self, patched_ray):
+        """Slot bookkeeping across a promotion: the dead actor gets no further
+        batches, every task terminates exactly once."""
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["poison"], ["ok"] * 20],
+            n_tasks=8,
+            batch_size=4,
+            max_retries=2,
+            standby=1,
+        )
+        summary = coord.run(tasks)
+        assert summary["succeeded"] == 8
+        assert summary["failed"] == 0
+
+        created = coord._test_worker_stub.created
+        poisoned = created[0]
+        # The poisoned actor saw exactly its first batch and nothing after
+        assert poisoned.completed == 0
+        assert poisoned.failed == 4
+
+        # Every task reached exactly one terminal state: all executions that produced.
+        assert sum(a.completed for a in created) == 8
+
+        stats = summary["worker_stats"]
+        assert len(stats) == 2, "exactly n_workers live slots at exit"
+        ids = sorted(ws["worker_id"] for ws in stats)
+        assert ids == [1, 2], (
+            "slot 0 must now hold the promoted standby (worker_id 2); "
+            f"got worker_ids {ids}"
+        )
 
 
 class TestCoordinatorShardedAggregator:

@@ -276,6 +276,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--standby", type=int, default=0,
+        help=(
+            "Number of pre-loaded standby workers kept idle for O(1) "
+            "replacement of hung/poisoned workers (default: 0 = every "
+            "replacement blocks on a fresh model load, the no-standby "
+            "behavior). GPU-memory cost: each standby holds a full "
+            "model in memory and claims the same Ray resources as a "
+            "regular worker, so budget for --workers + --standby "
+            "actors; with --hf-device >= 0 the fractional-GPU claims "
+            "are sized for --workers only, and standbys may not "
+            "schedule on an already-full device."
+        ),
+    )
+    parser.add_argument(
         "--decider-shards", type=int, default=1,
         dest="decider_shards",
         help=(
@@ -311,6 +325,13 @@ def main() -> None:
         )
         sys.exit(1)
 
+    if args.standby < 0:
+        print(
+            f"Error: --standby must be at least 0, got {args.standby}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if args.decider_shards < 1:
         print(
             f"Error: --decider-shards must be at least 1, "
@@ -337,6 +358,7 @@ def main() -> None:
         worker_cls=worker_cls,
         worker_kwargs=worker_kwargs,
         hf_device=args.hf_device,
+        standby=args.standby,
     )
 
     logger.info(

@@ -122,5 +122,5 @@ class TestNullVsRecordingEquivalence:
         assert rec.timer_count("agg_submit") >= 1
         for gauge in GAUGE_NAMES:
             assert rec.gauges[gauge], f"gauge {gauge!r} never emitted"
-        # No standby pool exists yet; the reserved gauge reads 0.
+        # Default --standby 0: no pool is ever populated.
         assert all(v == 0.0 for _, v in rec.gauges["standby"])

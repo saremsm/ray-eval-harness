@@ -30,6 +30,9 @@ HANG_MARGIN_S = 30.0
 # Poll interval when no refs are completing.
 RETRY_POLL_INTERVAL = 1.0
 
+# Bounded retries for asynchronous standby refills.
+STANDBY_REFILL_MAX_ATTEMPTS = 3
+
 # Per-backend batch sizes: vLLM's continuous batching saturates only with
 DEFAULT_BATCH_SIZE_HF = 4
 DEFAULT_BATCH_SIZE_VLLM = 64
@@ -81,6 +84,7 @@ class DistributedEvalCoordinator:
         worker_kwargs: dict | None = None,
         tensor_parallel_size: int = 1,
         hf_device: int = -1,
+        standby: int = 0,
     ) -> None:
         self.n_workers = n_workers
         self.model_name = model_name
@@ -119,6 +123,17 @@ class DistributedEvalCoordinator:
                 f"aggregator_shards must be >= 1, got {aggregator_shards}"
             )
         self.aggregator_shards = aggregator_shards
+        # Standby worker pool. 0 (default) = no pool: every replacement takes the
+        # blocking construct-and-wait path, exactly the no-standby behavior.
+        if standby < 0:
+            raise ValueError(f"standby must be >= 0, got {standby}")
+        self.standby = standby
+        # Ready, validated standby handles / refills still loading.
+        self._standby_pool: list = []
+        self._standby_refills: list = []
+        self._next_worker_id = n_workers
+        self._run_start = time.monotonic()
+        self._standby_stats = self._fresh_standby_stats()
         self._write_refs: list = []
         self._worker_cls = worker_cls or (
             VLLMWorker if backend == "vllm" else HFWorker
@@ -131,6 +146,7 @@ class DistributedEvalCoordinator:
         """run all tasks, return summary+worker_stats. results stream to JSONL non-
         blocking retry: failed batch -> deferred[] with wake-up time. back to
         pending[] when time hits. main loop keeps draining"""
+        self._run_start = time.monotonic()
         workers = self._create_workers()
         # Driver-side facade over N shard actors (batched writes).
         #   aggregator_shards=1 this is a passthrough around a single
@@ -212,8 +228,12 @@ class DistributedEvalCoordinator:
                 self._metrics.gauge("pending", float(len(pending)))
                 self._metrics.gauge("active", float(len(active)))
                 self._metrics.gauge("deferred", float(len(deferred)))
-                # No standby pool exists yet (see the TODO in _replace_worker)
-                self._metrics.gauge("standby", 0.0)
+                # Number of READY standby workers.
+                self._metrics.gauge("standby", float(len(self._standby_pool)))
+
+                # Harvest finished standby refills. ray.wait with non-blocking.
+                #   timeout=0 per in-flight readiness ping - strictly
+                self._poll_standby_refills()
 
                 # All workers dead => nothing can save us.
                 if all(w is None for w in workers):
@@ -308,6 +328,9 @@ class DistributedEvalCoordinator:
         summary = aggregator.get_summary()
         summary["worker_stats"] = worker_stats
         summary["hang_threshold_s"] = self.hang_threshold_s
+        # Pool size over time, promotions, refills, fallbacks.
+        summary["standby"] = self._standby_summary()
+        self._teardown_standby()
         return summary
 
     # Hung-worker handling
@@ -529,25 +552,47 @@ class DistributedEvalCoordinator:
             )
             for i in range(self.n_workers)
         ]
+        # N standby workers from the SAME factory.
+        self._standby_pool = []
+        self._standby_refills = []
+        self._next_worker_id = self.n_workers
+        self._standby_stats = self._fresh_standby_stats()
+        standbys = []
+        for _ in range(self.standby):
+            standbys.append(
+                remote_ctor(
+                    worker_id=self._next_worker_id,
+                    model_name=self.model_name,
+                    task_timeout=self.task_timeout,
+                    **extra_kwargs,
+                )
+            )
+            self._next_worker_id += 1
         # Bounded init barrier: without a timeout.
         try:
             ray.get(
-                [w.health_check.remote() for w in workers],
+                [w.health_check.remote() for w in workers + standbys],
                 timeout=WORKER_INIT_TIMEOUT_S,
             )
         except ray.exceptions.GetTimeoutError as exc:
             raise RuntimeError(
                 f"Workers did not become healthy within "
                 f"{WORKER_INIT_TIMEOUT_S}s. Most common cause: "
-                f"--workers ({self.n_workers}) exceeds available GPUs, or "
-                f"the model '{self.model_name}' failed to load. Check "
+                f"--workers ({self.n_workers}) + --standby "
+                f"({self.standby}) exceeds available GPUs, or the model "
+                f"'{self.model_name}' failed to load. Check "
                 f"`ray status` and worker logs."
             ) from exc
 
-        for worker in workers:
+        for worker in workers + standbys:
             validate_backend(worker)
-        
-        logger.info(f"All {self.n_workers} workers ready and validated")
+        self._standby_pool = standbys
+        self._sample_standby_pool()
+
+        logger.info(
+            f"All {self.n_workers} workers ready and validated"
+            + (f" (+{self.standby} standby)" if self.standby else "")
+        )
         return workers
     
     def _replace_worker(
@@ -556,8 +601,9 @@ class DistributedEvalCoordinator:
         failed_idx: int,
         max_attempts: int = 3,
     ) -> bool:
-        """replace a worker with bounded retries."""
-        # TODO: still blocks on model load. need standby pool for big models.
+        """Replace the worker in a slot. At --standby 0 (the default) the pool is
+        never populated, so every replacement takes that path: the no-standby
+        behavior, exactly, and not counted as a "fallback"."""
         self._metrics.count("replaced")
         old = workers[failed_idx]
         workers[failed_idx] = None  # nothing dispatches here while we work
@@ -567,8 +613,40 @@ class DistributedEvalCoordinator:
             except Exception:
                 pass  # already dead / not a real handle in tests
 
-        logger.warning(f"Replacing worker {failed_idx}")
+        if self._standby_pool:
+            promoted = self._standby_pool.pop()
+            workers[failed_idx] = promoted
+            self._standby_stats["promotions"] += 1
+            self._sample_standby_pool()
+            logger.warning(
+                f"Worker {failed_idx} replaced by standby "
+                f"(pool now {len(self._standby_pool)} ready); "
+                f"refilling in background"
+            )
+            self._start_standby_refill()
+            return True
 
+        if self.standby > 0:
+            # Pool configured but drained: replacements outpaced refills.
+            self._standby_stats["fallbacks"] += 1
+            logger.warning(
+                f"Standby pool empty ({len(self._standby_refills)} "
+                f"refill(s) still loading); falling back to blocking "
+                f"replacement for worker {failed_idx}"
+            )
+
+        logger.warning(f"Replacing worker {failed_idx}")
+        return self._blocking_replace(workers, failed_idx, max_attempts)
+
+    def _blocking_replace(
+        self,
+        workers: list,
+        failed_idx: int,
+        max_attempts: int = 3,
+    ) -> bool:
+        """Cold replacement: construct a worker and block on its model load, with
+        bounded retries. The slot must already be None and the old actor already
+        killed."""
         for attempt in range(max_attempts):
             try:
                 remote_ctor, extra_kwargs = self._worker_factory()
@@ -598,3 +676,126 @@ class DistributedEvalCoordinator:
             f"attempts. Marking slot dead; coordinator will skip it."
         )
         return False
+
+    # Standby pool
+    def _fresh_standby_stats(self) -> dict:
+        return {
+            "configured": self.standby,
+            "promotions": 0,
+            "refills_started": 0,
+            "refills_completed": 0,
+            "refill_failures": 0,
+            "fallbacks": 0,
+            # [elapsed_s, ready_pool_size], appended at startup and on every change.
+            "pool_timeline": [],
+        }
+
+    def _sample_standby_pool(self) -> None:
+        elapsed = time.monotonic() - self._run_start
+        self._standby_stats["pool_timeline"].append(
+            [round(elapsed, 3), len(self._standby_pool)]
+        )
+
+    def _start_standby_refill(self, attempt: int = 0) -> None:
+        """Submit a standby construction WITHOUT waiting on it: hold the ObjectRef
+        of a readiness ping (health_check.remote()) and let _poll_standby_refills
+        harvest it from the main loop."""
+        try:
+            remote_ctor, extra_kwargs = self._worker_factory()
+            handle = remote_ctor(
+                worker_id=self._next_worker_id,
+                model_name=self.model_name,
+                task_timeout=self.task_timeout,
+                **extra_kwargs,
+            )
+        except Exception as exc:
+            # Submission itself failed (not the async load)
+            logger.error(f"Standby refill submission failed: {exc}")
+            self._standby_stats["refill_failures"] += 1
+            return
+        self._next_worker_id += 1
+        ready_ref = handle.health_check.remote()
+        self._standby_refills.append(
+            [handle, ready_ref, time.monotonic(), attempt]
+        )
+        self._standby_stats["refills_started"] += 1
+
+    def _poll_standby_refills(self) -> None:
+        """Non-blocking readiness poll for in-flight refills (ray.wait(timeout=0)
+        per pending ping)."""
+        if not self._standby_refills:
+            return
+        in_flight = self._standby_refills
+        # _fail_refill may append a retry refill.
+        self._standby_refills = []
+        for handle, ready_ref, submitted_at, attempt in in_flight:
+            ready, _ = ray.wait([ready_ref], num_returns=1, timeout=0)
+            if not ready:
+                if time.monotonic() - submitted_at > WORKER_INIT_TIMEOUT_S:
+                    self._fail_refill(
+                        handle, attempt,
+                        reason=(
+                            f"readiness ping unanswered after "
+                            f"{WORKER_INIT_TIMEOUT_S:.0f}s"
+                        ),
+                    )
+                else:
+                    self._standby_refills.append(
+                        [handle, ready_ref, submitted_at, attempt]
+                    )
+                continue
+            try:
+                ray.get(ready_ref)
+                validate_backend(handle)
+            except Exception as exc:
+                self._fail_refill(handle, attempt, reason=repr(exc))
+                continue
+            self._standby_pool.append(handle)
+            self._standby_stats["refills_completed"] += 1
+            self._sample_standby_pool()
+            logger.info(
+                f"Standby refill ready "
+                f"(pool now {len(self._standby_pool)})"
+            )
+
+    def _fail_refill(self, handle, attempt: int, reason: str) -> None:
+        self._standby_stats["refill_failures"] += 1
+        try:
+            ray.kill(handle, no_restart=True)
+        except Exception:
+            pass  # never scheduled / not a real handle in tests
+        if attempt + 1 < STANDBY_REFILL_MAX_ATTEMPTS:
+            logger.warning(
+                f"Standby refill failed ({reason}); retrying "
+                f"(attempt {attempt + 2}/{STANDBY_REFILL_MAX_ATTEMPTS})"
+            )
+            self._start_standby_refill(attempt=attempt + 1)
+        else:
+            logger.error(
+                f"Standby refill failed ({reason}) after "
+                f"{STANDBY_REFILL_MAX_ATTEMPTS} attempts; the pool "
+                f"stays one smaller (blocking fallback still applies)"
+            )
+
+    def _standby_summary(self) -> dict:
+        stats = dict(self._standby_stats)
+        stats["pool_timeline"] = list(self._standby_stats["pool_timeline"])
+        stats["final_pool_size"] = len(self._standby_pool)
+        stats["refills_in_flight_at_exit"] = len(self._standby_refills)
+        return stats
+
+    def _teardown_standby(self) -> None:
+        """Kill idle standbys and abandoned refills at end of run so they don't
+        outlive the run holding GPU memory."""
+        for handle in self._standby_pool:
+            try:
+                ray.kill(handle, no_restart=True)
+            except Exception:
+                pass
+        for handle, _ref, _t, _a in self._standby_refills:
+            try:
+                ray.kill(handle, no_restart=True)
+            except Exception:
+                pass
+        self._standby_pool = []
+        self._standby_refills = []
