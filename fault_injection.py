@@ -14,7 +14,8 @@ def _stable_seed(*parts) -> int:
 
 
 class FailureDeciderImpl:
-    """Shared, deterministic fault-injection oracle."""
+    """Shared, deterministic fault-injection oracle. batch_key is the tuple of the
+    batch's task_ids (see FaultInjecting*Worker._should_fail)."""
 
     def __init__(self, seed: int = 0) -> None:
         self._seed = seed

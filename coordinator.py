@@ -53,12 +53,25 @@ def validate_backend(worker: object) -> None:
         )
 
 def classify_failure(exc: Exception) -> FailureKind:
-    """TRANSIENT = retry; DETERMINISTIC = error will recur, don't bother."""
+    """TRANSIENT = retry may succeed; DETERMINISTIC = the error will recur if the
+    same work is re-run."""
     msg = str(exc).lower()
     for pattern in _DETERMINISTIC_PATTERNS:
         if pattern in msg:
             return FailureKind.DETERMINISTIC
     return FailureKind.TRANSIENT
+
+
+def retry_entries(
+    batch: list[EvalTask],
+    retry_count: int,
+) -> list[tuple[list[EvalTask], int]]:
+    """Split policy, pure and deterministic (midpoint, no RNG)."""
+    new_rc = retry_count + 1
+    if len(batch) <= 1:
+        return [(batch, new_rc)]
+    mid = len(batch) // 2
+    return [(batch[:mid], new_rc), (batch[mid:], new_rc)]
 
 def backoff_seconds(retry_count: int, rng: random.Random | None = None) -> float:
     """exponential backoff, full jitter, cap 8s. full jitter (U[0, base]):
@@ -134,6 +147,8 @@ class DistributedEvalCoordinator:
         self._next_worker_id = n_workers
         self._run_start = time.monotonic()
         self._standby_stats = self._fresh_standby_stats()
+        # How many batch splits fired (reset per run).
+        self._split_count = 0
         self._write_refs: list = []
         self._worker_cls = worker_cls or (
             VLLMWorker if backend == "vllm" else HFWorker
@@ -147,6 +162,7 @@ class DistributedEvalCoordinator:
         blocking retry: failed batch -> deferred[] with wake-up time. back to
         pending[] when time hits. main loop keeps draining"""
         self._run_start = time.monotonic()
+        self._split_count = 0
         workers = self._create_workers()
         # Driver-side facade over N shard actors (batched writes).
         #   aggregator_shards=1 this is a passthrough around a single
@@ -301,9 +317,16 @@ class DistributedEvalCoordinator:
                         )
                         if should_retry:
                             # Non-blocking: schedule for later, free the worker now.
-                            ready_at = time.monotonic() + backoff_seconds(retry_count)
-                            deferred.append((ready_at, batch, retry_count + 1))
-                            self._metrics.count("retried")
+                            for sub_batch, new_rc in self._retry_entries(
+                                batch, retry_count
+                            ):
+                                deferred.append((
+                                    time.monotonic()
+                                    + backoff_seconds(retry_count),
+                                    sub_batch,
+                                    new_rc,
+                                ))
+                                self._metrics.count("retried")
 
                     with self._metrics.timer("dispatch"):
                         self._assign_next(worker_idx, pending, submit)
@@ -328,6 +351,8 @@ class DistributedEvalCoordinator:
         summary = aggregator.get_summary()
         summary["worker_stats"] = worker_stats
         summary["hang_threshold_s"] = self.hang_threshold_s
+        # How many failed batches were re-queued as halves.
+        summary["retry_splits"] = self._split_count
         # Pool size over time, promotions, refills, fallbacks.
         summary["standby"] = self._standby_summary()
         self._teardown_standby()
@@ -369,10 +394,14 @@ class DistributedEvalCoordinator:
                 else self.max_retries
             )
             if retry_count < task_max_retries:
-                pending.append((batch, retry_count + 1))
-                self._metrics.count("retried")
+                # Same split policy as the exception path.
+                entries = self._retry_entries(batch, retry_count)
+                for sub_batch, new_rc in entries:
+                    pending.append((sub_batch, new_rc))
+                    self._metrics.count("retried")
                 logger.info(
-                    f"Re-queued {len(batch)} tasks "
+                    f"Re-queued {len(batch)} tasks as "
+                    f"{len(entries)} entr{'ies' if len(entries) > 1 else 'y'} "
                     f"(retry_count now {retry_count + 1}, "
                     f"max {task_max_retries})"
                 )
@@ -441,15 +470,16 @@ class DistributedEvalCoordinator:
             if batch[0].max_retries is not None
             else self.max_retries
         )
-        should_retry = (
-            kind == FailureKind.TRANSIENT
-            and retry_count < task_max_retries
+        # With retries remaining, a multi-task batch ALWAYS re-queues (as two halves)
+        should_retry = retry_count < task_max_retries and (
+            kind == FailureKind.TRANSIENT or len(batch) > 1
         )
         if should_retry:
             logger.info(
                 f"Scheduling retry {retry_count + 1}/{task_max_retries} "
-                f"for {len(batch)} tasks "
-                f"(backoff: {backoff_seconds(retry_count):.1f}s)"
+                f"for {len(batch)} tasks"
+                + (" as two halves" if len(batch) > 1 else "")
+                + " (backoff: full jitter per enqueued half)"
             )
             return True
 
@@ -509,6 +539,17 @@ class DistributedEvalCoordinator:
         if pending:
             batch, retry_count = pending.popleft()
             submit(worker_idx, batch, retry_count)
+
+    def _retry_entries(
+        self,
+        batch: list[EvalTask],
+        retry_count: int,
+    ) -> list[tuple[list[EvalTask], int]]:
+        """Counting wrapper over the pure module-level retry_entries (split-retry)"""
+        entries = retry_entries(batch, retry_count)
+        if len(entries) > 1:
+            self._split_count += 1
+        return entries
 
     def _worker_factory(self):
         """Return (constructor_callable, extra_kwargs) for configured backend."""

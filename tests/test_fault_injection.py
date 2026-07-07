@@ -1,6 +1,11 @@
 import pytest
 
+from collections import deque
+
+from coordinator import retry_entries
 from fault_injection import FailureDeciderImpl, _stable_seed
+from types_ import EvalTask
+from utils import make_batches
 
 
 class TestStableSeed:
@@ -28,12 +33,67 @@ class TestFailureDeciderImpl:
         result = decider.should_fail(batch_key, 0.3)
         assert isinstance(result, bool)
 
-    def test_deterministic_across_fresh_deciders(self):
-        """Same seed + same key + same attempt -> same decision."""
-        d1 = FailureDeciderImpl(seed=42)
-        d2 = FailureDeciderImpl(seed=42)
-        key = ("a", "b", "c")
-        assert d1.should_fail(key, 0.5) == d2.should_fail(key, 0.5)
+    def test_task_level_outcomes_reproducible_across_runs(self):
+        """Reproducibility is asserted at the task level, not the key level: split-
+        retry halves are NEW batch keys with fresh attempt counters, so the KEY
+        stream a run queries depends on which batches fail."""
+
+        def simulate(seed: int) -> tuple[list, list]:
+            """Deterministic replay of the split-retry policy: injected failures are
+            TRANSIENT, so a (sub-)batch with budget left re-queues via
+            retry_entries (halves for multi-task batches, whole for singletons)"""
+            decider = FailureDeciderImpl(seed=seed)
+            tasks = [
+                EvalTask(task_id=f"task_{i:05d}", prompt="p")
+                for i in range(64)
+            ]
+            queue = deque(
+                (batch, 0) for batch in make_batches(tasks, 8)
+            )
+            outcomes: dict[str, tuple] = {}
+            decisions: list[tuple] = []
+            while queue:
+                batch, rc = queue.popleft()
+                key = tuple(t.task_id for t in batch)
+                failed = decider.should_fail(key, 0.4)
+                decisions.append((key, rc, failed))
+                if not failed:
+                    for t in batch:
+                        outcomes[t.task_id] = ("ok", rc)
+                elif rc < 3:  # max_retries
+                    queue.extend(retry_entries(batch, rc))
+                else:
+                    for t in batch:
+                        outcomes[t.task_id] = ("failed", rc)
+            # Task-level outcome sequence: per task, in task order.
+            ordered = [
+                (t.task_id, *outcomes[t.task_id]) for t in tasks
+            ]
+            return ordered, decisions
+
+        run1_outcomes, run1_decisions = simulate(seed=42)
+        run2_outcomes, run2_decisions = simulate(seed=42)
+
+        assert run1_outcomes == run2_outcomes, (
+            "same seed must reproduce the identical task-level outcome "
+            "sequence across runs"
+        )
+        assert run1_decisions == run2_decisions, (
+            "same seed must reproduce the identical ordered decision "
+            "sequence, split-generated keys included"
+        )
+        # Every task reaches exactly one outcome.
+        assert len(run1_outcomes) == 64
+        # Sanity: the run exercised both outcomes and the split path.
+        statuses = {status for _, status, _ in run1_outcomes}
+        assert statuses == {"ok", "failed"}
+        assert any(len(key) < 8 for key, _, _ in run1_decisions), (
+            "no split-generated key ever reached the decider; the "
+            "simulation is not exercising the split-retry policy"
+        )
+        # Different seed diverges.
+        run3_outcomes, _ = simulate(seed=99)
+        assert run3_outcomes != run1_outcomes
 
     def test_attempt_counter_advances(self):
         """Successive calls on the same key advance attempt count."""

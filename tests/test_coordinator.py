@@ -810,12 +810,14 @@ class TestCoordinatorIntegration:
         assert summary["failed"] == 0
 
     def test_retry_exhaustion_records_failed_results(self, patched_ray):
-        # Every call on worker 0 raises. Worker 1 succeeds.
-        #   max_retries=1, worker 0's batch lands in failed bucket
+        """With split-retry, a batch that failed on one worker can succeed as halves
+        on another, so the old one-bad-worker setup no longer exhausts
+        deterministically. Each task is attempted exactly max_retries + 1 = 2"""
+        _FakeAggregator.instances.clear()
         coord, tasks = _coordinator_with_fake_workers(
             plan_per_worker=[
-                ["raise"] * 10,
-                ["ok"] * 10,
+                ["raise"] * 20,
+                ["raise"] * 20,
             ],
             n_tasks=8,
             max_retries=1,
@@ -823,11 +825,25 @@ class TestCoordinatorIntegration:
         summary = coord.run(tasks)
 
         assert summary["total"] == 8
-        assert summary["failed"] >= 1, (
-            "At least one batch should land in the failed bucket after "
-            f"retry exhaustion. Summary: {summary}"
+        assert summary["failed"] == 8
+        assert summary["succeeded"] == 0
+        assert summary["retry_splits"] == 2, (
+            "each of the two 4-batches splits exactly once before the "
+            "budget gate stops further splitting"
         )
-        assert summary["succeeded"] + summary["failed"] == 8
+
+        # Exactly one terminal state per task.
+        recorded = [
+            r.task_id for s in _FakeAggregator.instances for r in s.results
+        ]
+        assert sorted(recorded) == sorted(t.task_id for t in tasks), (
+            "every task must reach exactly one terminal state - no "
+            "duplicates, no drops"
+        )
+
+        # Per-task retry counts: max_retries + 1 attempts each.
+        created = coord._test_worker_stub.created
+        assert sum(a.failed for a in created) == 16
 
     def test_replace_worker_kills_old_actor(self, patched_ray):
         """Must ray.kill the old actor before building the replacement: a dropped
@@ -891,6 +907,264 @@ class TestCoordinatorIntegration:
         )
         assert summary["failed"] == 8
         assert summary["succeeded"] == 0
+
+
+class _ContentAwareActor:
+    """Worker fake whose failures depend on batch CONTENT: raises whenever."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        bad_task_id: str,
+        error_msg: str,
+        **_unused,
+    ) -> None:
+        self.worker_id = worker_id
+        self._bad = bad_task_id
+        self._error_msg = error_msg
+        self.completed = 0
+        self.failed = 0
+        self.poisoned = False
+        self.failing_batches: list[tuple[str, ...]] = []
+
+    @property
+    def evaluate_batch(self):
+        def _fn(tasks):
+            ids = tuple(t.task_id for t in tasks)
+            if self._bad in ids:
+                self.failed += len(tasks)
+                self.failing_batches.append(ids)
+                raise RuntimeError(self._error_msg)
+            self.completed += len(tasks)
+            return [
+                EvalResult(
+                    task_id=t.task_id,
+                    score=1.0,
+                    response="ok",
+                    latency_seconds=0.01,
+                    batch_latency_seconds=0.01,
+                    worker_id=self.worker_id,
+                )
+                for t in tasks
+            ]
+        return _FakeActorMethod(_fn)
+
+    @property
+    def health_check(self):
+        return _FakeActorMethod(lambda: True)
+
+    @property
+    def get_stats(self):
+        return _FakeActorMethod(lambda: {
+            "worker_id": self.worker_id,
+            "model": "fake", "backend": "fake",
+            "completed": self.completed, "failed": self.failed,
+            "poisoned": False,
+        })
+
+
+def _content_aware_coordinator(
+    bad_task_id: str,
+    error_msg: str,
+    n_tasks: int,
+    batch_size: int,
+    max_retries: int,
+) -> tuple[DistributedEvalCoordinator, list[EvalTask], list]:
+    """Single-worker coordinator over _ContentAwareActor; returns (coord, tasks,
+    created_actors)."""
+    created: list = []
+
+    class _Stub:
+        @staticmethod
+        def remote(**kwargs):
+            actor = _ContentAwareActor(
+                bad_task_id=bad_task_id, error_msg=error_msg, **kwargs
+            )
+            created.append(actor)
+            return actor
+
+        @staticmethod
+        def options(**_kwargs):
+            return _Stub
+
+    coord = DistributedEvalCoordinator(
+        n_workers=1,
+        model_name="fake-model",
+        backend="hf",
+        max_retries=max_retries,
+        task_timeout=60.0,
+        output_path="results/test.jsonl",
+        batch_size=batch_size,
+        aggregator_cls=_FakeAggregator,
+        worker_cls=_Stub,
+    )
+    tasks = [make_task(f"t{i:03d}") for i in range(n_tasks)]
+    return coord, tasks, created
+
+
+class TestSplitRetry:
+    """A failed multi-task batch re-queues as two midpoint halves."""
+
+    # The pure policy (module-level retry_entries)
+    def test_splits_multi_task_batch_in_half_preserving_order(self):
+        batch = [make_task(f"t{i}") for i in range(5)]
+        entries = coord_mod.retry_entries(batch, retry_count=0)
+        assert len(entries) == 2
+        (first, rc1), (second, rc2) = entries
+        assert rc1 == rc2 == 1
+        assert first == batch[:2] and second == batch[2:], (
+            "midpoint split, no shuffling"
+        )
+        assert first + second == batch, (
+            "concatenating the halves must reproduce the original task "
+            "order exactly"
+        )
+
+    def test_singleton_retries_whole(self):
+        batch = [make_task("t0")]
+        assert coord_mod.retry_entries(batch, retry_count=1) == [(batch, 2)]
+
+    def test_split_inherits_and_never_resets_budget(self):
+        """Halves carry parent retry_count + 1: a task's budget follows it through
+        every split."""
+        batch = [make_task(f"t{i}") for i in range(4)]
+        entries = coord_mod.retry_entries(batch, retry_count=2)
+        assert [rc for _, rc in entries] == [3, 3]
+        # Split again: grandchildren carry 4, not a reset value.
+        (half, rc) = entries[0]
+        assert [r for _, r in coord_mod.retry_entries(half, rc)] == [4, 4]
+
+    # Coordinator integration
+    def test_deterministic_poison_isolated_in_log2_failures(self, patched_ray):
+        """A task that DETERMINISTICALLY fails any batch containing it is bisected
+        to a singleton in log2(batch_size) failures, then recorded terminal
+        immediately (a deterministic singleton never retries)"""
+        _FakeAggregator.instances.clear()
+        coord, tasks, created = _content_aware_coordinator(
+            bad_task_id="t003",
+            error_msg="token indices sequence length longer than 512",
+            n_tasks=8,
+            batch_size=8,
+            max_retries=5,
+        )
+        summary = coord.run(tasks)
+
+        assert summary["succeeded"] == 7
+        assert summary["failed"] == 1
+
+        actor = created[0]
+        sizes = [len(ids) for ids in actor.failing_batches]
+        assert sizes == [8, 4, 2, 1], (
+            f"bisection must halve the failing batch each step "
+            f"(log2(8) splits + the terminal singleton); got {sizes}"
+        )
+        assert all("t003" in ids for ids in actor.failing_batches)
+        assert summary["retry_splits"] == 3
+
+        # Terminal state exactly once per task; the failure is t003.
+        shard = _FakeAggregator.instances[0]
+        recorded = sorted(r.task_id for r in shard.results)
+        assert recorded == sorted(t.task_id for t in tasks)
+        failed_ids = [r.task_id for r in shard.results if r.failed]
+        assert failed_ids == ["t003"]
+        assert all(
+            r.failure_kind == FailureKind.DETERMINISTIC
+            for r in shard.results if r.failed
+        )
+
+    def test_transient_poison_per_task_retry_counts(self, patched_ray):
+        """A TRANSIENTLY-always-failing task: splitting must not reset the budget.
+        max_retries=2 with batch_size=4 -> the bad task rides rc0 (4), rc1 (2),
+        rc2 (1) = exactly max_retries + 1 attempts, then terminal."""
+        _FakeAggregator.instances.clear()
+        coord, tasks, created = _content_aware_coordinator(
+            bad_task_id="t000",
+            error_msg="flaky infra (injected transient)",
+            n_tasks=4,
+            batch_size=4,
+            max_retries=2,
+        )
+        summary = coord.run(tasks)
+
+        assert summary["succeeded"] == 3
+        assert summary["failed"] == 1
+
+        actor = created[0]
+        # Per-task retry count for the bad task: attempts = failing executions.
+        assert len(actor.failing_batches) == 3
+        assert [len(ids) for ids in actor.failing_batches] == [4, 2, 1]
+
+        shard = _FakeAggregator.instances[0]
+        recorded = sorted(r.task_id for r in shard.results)
+        assert recorded == sorted(t.task_id for t in tasks), (
+            "exactly one terminal state per task"
+        )
+        failed = [r for r in shard.results if r.failed]
+        assert [r.task_id for r in failed] == ["t000"]
+        assert failed[0].failure_kind == FailureKind.TRANSIENT
+        assert "flaky infra" in failed[0].error
+
+    def test_backoff_drawn_per_enqueued_half(self, patched_ray, monkeypatch):
+        """One split must draw backoff twice - once per half, both from the parent
+        retry_count - so the halves' wake-ups decorrelate."""
+        calls: list[int] = []
+        real = coord_mod.backoff_seconds
+
+        def spy(retry_count, rng=None):
+            calls.append(retry_count)
+            return real(retry_count, rng)
+
+        monkeypatch.setattr(coord_mod, "backoff_seconds", spy)
+        coord, tasks = _coordinator_with_fake_workers(
+            plan_per_worker=[["raise", "ok", "ok", "ok"], ["ok"] * 8],
+            n_tasks=8,
+            max_retries=2,
+        )
+        summary = coord.run(tasks)
+        assert summary["succeeded"] == 8
+        assert calls == [0, 0], (
+            "exactly one backoff draw per enqueued half, both at the "
+            f"parent retry_count; got draws at {calls}"
+        )
+
+    def test_hang_path_splits_multi_task_batch(self):
+        """Hang eviction with retries remaining re-queues the batch as two halves
+        with retry_count + 1, order preserved, straight to pending (no backoff),
+        through the same submit path."""
+        coord = make_coordinator(max_retries=2)
+        coord._replace_worker = lambda workers, idx: None
+        ref = _Ref("r0")
+        batch = [make_task(f"t{i}") for i in range(4)]
+        active = {ref: (0, batch, 0)}
+        ref_timeouts = {ref: time.monotonic() - coord.hang_threshold_s - 1.0}
+        pending: deque = deque()
+        submitted = []
+
+        agg = _CapturingAggregator()
+        coord._handle_timeouts(
+            active=active,
+            ref_timeouts=ref_timeouts,
+            workers=[_FakeWorker()],
+            pending=pending,
+            submit=lambda widx, b, retry_count=0: submitted.append(
+                (b, retry_count)
+            ),
+            aggregator=agg,
+        )
+
+        assert ref not in active
+        # First half dispatched immediately to the replacement slot.
+        assert len(submitted) == 1 and len(pending) == 1
+        first_half, rc_first = submitted[0]
+        second_half, rc_second = pending[0]
+        assert rc_first == 1 and rc_second == 1, (
+            "halves inherit parent retry_count + 1"
+        )
+        assert first_half + second_half == batch, (
+            "the two halves must reassemble the original batch in order"
+        )
+        assert agg.results == [], "no terminal record while retrying"
+        assert coord._split_count == 1
 
 
 class TestStandbyPool:
