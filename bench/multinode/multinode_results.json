@@ -1,0 +1,52 @@
+{
+  "kill_epoch": 1783885595.537,
+  "kill_epoch_source": "kill_marker (head clock)",
+  "workers_ready_epoch": 1783885500.0,
+  "promotion_log_epoch": 1783885599.0,
+  "recovery": {
+    "first_replacement_sample_epoch": 1783885599.982,
+    "bounds_from_kill_s": [
+      2.443000078201294,
+      4.445000171661377
+    ],
+    "kill_to_first_replacement_batch_s": 4.445000171661377
+  },
+  "phases": {
+    "before": {
+      "window_s": [
+        1783885500.0,
+        1783885595.537
+      ],
+      "tasks_per_s": 108.52339937842669
+    },
+    "during": {
+      "window_s": [
+        1783885595.537,
+        1783885599.982
+      ],
+      "tasks_per_s": 43.19459900678417
+    },
+    "after": {
+      "window_s": [
+        1783885599.982,
+        1783885686.117
+      ],
+      "tasks_per_s": 109.59540257787407
+    }
+  },
+  "retried_due_to_kill": {
+    "tasks": 64,
+    "retry_events": 1,
+    "note": "sum over retry log events; a task re-queued twice counts twice"
+  },
+  "accounting": {
+    "submitted": 20000,
+    "completed_unique": 20000,
+    "completed_pct": 100.0,
+    "rows": 20000,
+    "duplicate_task_ids": 0,
+    "failed_rows": 0,
+    "rows_on_replacement_workers": 9504,
+    "pass_100pct": true
+  }
+}

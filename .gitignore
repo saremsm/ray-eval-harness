@@ -12,3 +12,5 @@ bench/results/*
 !bench/results/BASELINE.md
 !bench/results/published/
 !bench/results/published/**
+!bench/results/SHARDED.md
+!bench/results/VLLM_BATCH_SWEEP.md
