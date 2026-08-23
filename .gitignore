@@ -14,3 +14,5 @@ bench/results/*
 !bench/results/published/**
 !bench/results/SHARDED.md
 !bench/results/VLLM_BATCH_SWEEP.md
+!bench/results/sharded_overlay.png
+!bench/results/sat_w8_l050_b8.json

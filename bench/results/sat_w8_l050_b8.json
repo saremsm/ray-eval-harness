@@ -1,0 +1,143 @@
+{
+  "args": {
+    "workers": 8,
+    "latency_s": 0.05,
+    "batch_size": 8,
+    "tasks": 2000,
+    "fail_rate": 0.0,
+    "jitter": 0.1,
+    "seed": 0,
+    "agg_probe_every": 32,
+    "out": "bench\\results\\sat_w8_l050_b8.json"
+  },
+  "env": {
+    "ray_version": "2.50.0",
+    "cpu_count": 16,
+    "python": "3.10.6"
+  },
+  "offered_load_tasks_per_s": 1280.0,
+  "achieved": {
+    "tasks_recorded": 2000,
+    "succeeded": 2000,
+    "failed": 0,
+    "wall_time_s": 2.2660000000032596,
+    "throughput_tasks_per_s_wall": 882.6125330967003,
+    "throughput_tasks_per_s_aggregator": 1084.2310947506414
+  },
+  "saturated": true,
+  "loop": {
+    "iterations": 250,
+    "span_s": 1.827999999979511,
+    "iterations_per_s": 136.76148796652194
+  },
+  "steady_state": {
+    "window_definition": "middle 60% of the loop_iter span",
+    "window_s": 1.096799999999348,
+    "loop_duty_cycle": 0.9974471188762042,
+    "timer_totals_s": {
+      "loop_iter": 1.0939999999827705,
+      "ray_wait": 0.7039999999396969,
+      "dispatch": 0.03200000000651926,
+      "agg_submit": 0.26500000001396984
+    },
+    "share_of_loop_iter": {
+      "ray_wait": 0.64351005479962,
+      "dispatch": 0.029250457044810996,
+      "agg_submit": 0.24223034736576174,
+      "unaccounted": 0.08500914078980726
+    }
+  },
+  "agg_call_latency": {
+    "note": "add_result submit-to-ready latency measured coordinator-side; Ray exposes no actor mailbox depth, so FIFO call latency is the proxy for aggregator queue depth",
+    "probe_every_nth_call": 32,
+    "samples": 62,
+    "p50_s": 0.0,
+    "p90_s": 0.01600000000325963,
+    "p99_s": 0.031000000017229468,
+    "max_s": 0.031000000017229468
+  },
+  "gauges": {
+    "interval_s": 0.5,
+    "series": {
+      "pending": [
+        [
+          0.0,
+          186.0
+        ],
+        [
+          0.5,
+          114.0
+        ],
+        [
+          1.0,
+          41.0
+        ],
+        [
+          1.5,
+          0.0
+        ]
+      ],
+      "active": [
+        [
+          0.0,
+          8.0
+        ],
+        [
+          0.5,
+          8.0
+        ],
+        [
+          1.0,
+          8.0
+        ],
+        [
+          1.5,
+          1.0
+        ]
+      ],
+      "deferred": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.5,
+          0.0
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.5,
+          0.0
+        ]
+      ],
+      "standby": [
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.5,
+          0.0
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.5,
+          0.0
+        ]
+      ]
+    }
+  },
+  "counts": {
+    "completed": 2000,
+    "failed": 0,
+    "retried": 0,
+    "replaced": 0
+  },
+  "results_jsonl": "C:\\Users\\Shahid\\AppData\\Local\\Temp\\sat_bench_xznufqkz\\results.jsonl"
+}
