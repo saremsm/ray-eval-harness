@@ -154,13 +154,20 @@ Measured sweep (Lambda A10 24 GB, `Qwen/Qwen2.5-1.5B`, vLLM backend, 1 worker, 1
 |            128 |                117.1 |            8 |
 |            256 |                120.1 |            4 |
 
-The default of 64 captures most of the available throughput (12.7x the batch=4 row) without committing all of GPU memory to in-flight KV cache; from 128 to 256 the sweep gains almost nothing (117.1 -> 120.1 tasks/s) for real memory - past saturation, extra batch size buys KV-cache commitment, not speed.
+The default of 64 captures most of the available throughput (12.5x the batch=4 row) without committing all of GPU memory to in-flight KV cache; from 128 to 256 the sweep gains almost nothing (117.1 -> 120.1 tasks/s) for real memory - past saturation, extra batch size buys KV-cache commitment, not speed.
 
 **Read latency columns with care.** `latency_seconds` in run summaries is an estimate - batch wall time / batch size - so it *mechanically shrinks* as batch size grows; any apparent p99 "improvement" down the table is an artifact of the estimator. A task's real time-in-system grows with batch size (it waits for its whole batch). The summary also reports **batch latency** (measured wall time of the batch a task rode in, task-weighted), which is the honest per-task figure; use throughput and batch latency to compare configurations.
 
 ## Fault injection and reproducibility
 
 Both backends use greedy decoding (`temperature=0.0` on vLLM; the HF text-generation pipeline defaults to `do_sample=False`). Outputs are empirically stable across runs, but greedy decoding under continuous batching is not *guaranteed* bitwise-deterministic: batch composition changes kernel shapes and reduction orders, and composition varies with retry timing (backoff jitter deliberately uses an unseeded RNG). Failure *decisions* are fully deterministic; wall-clock scheduling is not.
+
+Verified once on GPU (commit `1af667c`): at 200 tasks / batch 16, two
+seed-42 runs were identical down to which batch exhausted its retry
+budget - 16/16 terminal failures, 96/96 events - and seed 99 diverges. A
+first attempt at 50 tasks / batch 64 was invalidated as structurally
+unable to exercise the path: at batch 64, 50 tasks is a single batch, so
+there was nothing to vary.
 
 Failure injection goes through a shared `FailureDecider` (`--decider-shards` actors behind a facade) that all fault-injecting workers query. The decider tracks per-batch attempt counts, so a decision is a function of `(seed, batch_key, attempt, failure_rate)` and not of which worker happened to receive the batch - the naive per-worker seeded RNG gives reproducible per-worker sequences but not reproducible task-level failures, because Ray routes batches non-deterministically. Sharding cannot change which batches fail: every shard gets the same seed, routing hashes the key only, so each key's attempt counter keeps shard affinity and the failure sequence at any shard count is identical to the single actor's (pinned by a 500-batch N=1-vs-N=4 equality test). With split-retry, halves are new keys with fresh attempt counters, so the reproducibility guarantee is stated - and tested - at the task level: same seed, same per-task outcomes, run after run (`tests/test_fault_injection.py`, including a regression for an earlier bug where Python's per-process-randomized `hash()` defeated the seeded RNG).
 

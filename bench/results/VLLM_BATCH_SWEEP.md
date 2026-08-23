@@ -26,7 +26,7 @@ anything), but re-run before quoting them as current.
 
 Throughput climbs steeply with batch size because continuous batching
 only saturates when many requests are in flight; the default of 64
-captures most of the available throughput (12.7x the batch=4 baseline)
+captures most of the available throughput (12.5x the batch=4 baseline)
 without committing all of GPU memory to in-flight KV cache.
 
 ## Latency caveat
